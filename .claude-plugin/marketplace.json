@@ -1,0 +1,18 @@
+{
+  "name": "projectify",
+  "owner": {
+    "name": "Projectify",
+    "url": "https://projectify.si"
+  },
+  "metadata": {
+    "description": "The Projectify plugin for Claude Code."
+  },
+  "plugins": [
+    {
+      "name": "projectify",
+      "source": "./plugins/projectify",
+      "description": "Projectify: the board tools, a SessionStart hook and skills to plan, pick up and hand off work.",
+      "version": "1.0.0"
+    }
+  ]
+}

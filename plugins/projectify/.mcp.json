@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "souls-pm": {
+      "type": "http",
+      "url": "https://api.projectify.si/mcp"
+    }
+  }
+}
