@@ -1,6 +1,6 @@
 # Projectify for Claude Code
 
-Generated from `packages/shared/src/skills.ts` in the Projectify repo by `scripts/build-plugin.ts`. Do not edit by hand.
+Your Projectify board inside Claude Code: the board tools, a session hook that briefs every chat, and the Projectify skills.
 
 ## Install
 
