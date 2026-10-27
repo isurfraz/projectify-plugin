@@ -1,0 +1,717 @@
+#!/usr/bin/env node
+// projectify: the Projectify fleet launcher (SPM-479, D-088). One file, Node 18+, no dependencies.
+//
+//   projectify fleet [KEYS…] [--workers N] [--until-empty] [--dry-run]
+//   projectify fleet doctor
+//   projectify fleet status
+//   projectify fleet stop [--now]
+//   projectify setup-machine [FOLDERS…] [--dry-run]
+//
+// The launcher long-polls the board over HTTPS with this machine's token, so waiting for work costs no
+// Claude tokens, and starts one `claude --bg --worktree` worker per task in the project's repo.
+'use strict';
+
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { spawn, spawnSync } = require('node:child_process');
+
+const PLUGIN_ROOT = path.resolve(__dirname, '..');
+const DATA_DIR = process.env.PROJECTIFY_DATA_DIR || process.env.CLAUDE_PLUGIN_DATA || path.join(os.homedir(), '.claude', 'plugins', 'data', 'projectify-projectify');
+const TOKEN_FILE = path.join(DATA_DIR, 'token');
+const STATE_FILE = path.join(DATA_DIR, 'fleet.json');
+const LOG_FILE = path.join(DATA_DIR, 'fleet.log');
+const CLAUDE_JSON = process.env.PROJECTIFY_CLAUDE_JSON || path.join(os.homedir(), '.claude.json');
+const SHIM = path.join(process.env.PROJECTIFY_SHIM_DIR || path.join(os.homedir(), '.local', 'bin'), 'projectify');
+
+const NEXT_WAIT_S = 25;
+const HEARTBEAT_MS = 30_000;
+const WATCH_MS = 10_000;
+const MIN_NODE = 18;
+const MIN_CLAUDE = '2.1.299'; // the version the SPM-191 spike ran (FLEET-PLAN §11a)
+const DEFAULT_FOLDERS = ['~/Documents/GitHub', '~/code'];
+// The --settings every worker starts with (SPM-480). Ask rules the plugin cannot ship itself (§11a.10): pushes to
+// main ask on the board. The statusline saves plan use to quota.json for the heartbeat. A repo's own .mcp.json
+// servers are approved up front: each worker is a new worktree folder, so its "New MCP server" prompt would block it.
+const DEFAULT_WORKER_SETTINGS = {
+  permissions: { ask: ['Bash(git push origin main:*)', 'Bash(git push origin HEAD:main:*)', 'Bash(git push -f origin main:*)', 'Bash(git push --force origin main:*)'] },
+  statusLine: { type: 'command', command: `${JSON.stringify(path.join(PLUGIN_ROOT, 'hooks', 'statusline.sh'))} ${JSON.stringify(DATA_DIR)}` },
+  enableAllProjectMcpServers: true,
+  // a repo onboarded into Projectify carries its own `projectify` server in .mcp.json; signed out, it shadows the
+  // plugin's signed-in one (same URL) and the worker cannot reach the board
+  disabledMcpjsonServers: ['projectify', 'souls-pm'],
+};
+/** worker-settings.json in the data folder adds to (or replaces keys of) the defaults. */
+const workerSettings = () => ({ ...DEFAULT_WORKER_SETTINGS, ...(readJson(path.join(DATA_DIR, 'worker-settings.json')) ?? {}) });
+// Workers load no claude.ai connectors (§11a.7: they were most of a worker's ~61k baseline); the plugin's own server stays.
+const WORKER_ENV = { ENABLE_CLAUDEAI_MCP_SERVERS: 'false' };
+/** Plan use the worker statusline last wrote (SPM-480), for the heartbeat's quota stop. */
+const quota = () => readJson(path.join(DATA_DIR, 'quota.json'));
+
+// ---------------------------------------------------------------------------------------------
+// small helpers
+// ---------------------------------------------------------------------------------------------
+
+const readJson = (file) => {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+};
+const tilde = (p) => (p.startsWith('~/') ? path.join(os.homedir(), p.slice(2)) : p);
+const untilde = (p) => (p.startsWith(os.homedir() + path.sep) ? '~' + p.slice(os.homedir().length) : p);
+const stamp = () => new Date().toTimeString().slice(0, 8);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function log(line) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.appendFileSync(LOG_FILE, `${new Date().toISOString()} ${line}\n`);
+  } catch {
+    // the log is a convenience; the terminal line is what matters
+  }
+}
+/** One terminal line per event, also in fleet.log. */
+function say(line) {
+  console.log(`${stamp()}  ${line}`);
+  log(line);
+}
+function die(msg, code = 1) {
+  console.error(`projectify: ${msg}`);
+  process.exit(code);
+}
+
+function pluginVersion() {
+  return readJson(path.join(PLUGIN_ROOT, '.claude-plugin', 'plugin.json'))?.version ?? 'dev';
+}
+
+/** The API base: PROJECTIFY_API, else the plugin's .mcp.json server with /mcp swapped for /v1. */
+function apiBase() {
+  const env = process.env.PROJECTIFY_API?.trim();
+  if (env) return env.replace(/\/+$/, '').replace(/\/v1$/, '') + '/v1';
+  const url = readJson(path.join(PLUGIN_ROOT, '.mcp.json'))?.mcpServers?.projectify?.url ?? 'https://api.projectify.si/mcp';
+  return url.replace(/\/mcp\/?$/, '') + '/v1';
+}
+
+function token() {
+  const env = process.env.PROJECTIFY_TOKEN?.trim();
+  if (env) return env;
+  try {
+    return fs.readFileSync(TOKEN_FILE, 'utf8').trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+class ApiError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+async function api(method, route, body, { signal, timeoutMs = 30_000 } = {}) {
+  const t = token();
+  if (!t) throw new ApiError(0, `no machine token at ${untilde(TOKEN_FILE)}. Run /projectify:setup in Claude Code on this machine.`);
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  const onAbort = () => ac.abort();
+  signal?.addEventListener('abort', onAbort);
+  try {
+    const res = await fetch(apiBase() + route, {
+      method,
+      headers: { authorization: `Bearer ${t}`, ...(body ? { 'content-type': 'application/json' } : {}), 'user-agent': `projectify-launcher/${pluginVersion()}` },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: ac.signal,
+    });
+    const text = await res.text();
+    let json = null;
+    try {
+      json = text ? JSON.parse(text) : null;
+    } catch {
+      // not JSON: report the status
+    }
+    if (!res.ok) throw new ApiError(res.status, json?.error?.message ?? json?.message ?? `${res.status} ${res.statusText}`);
+    return json;
+  } catch (e) {
+    if (e instanceof ApiError) throw e;
+    if (ac.signal.aborted && !signal?.aborted) throw new ApiError(0, `${apiBase()} did not answer in ${Math.round(timeoutMs / 1000)} s`);
+    throw new ApiError(0, `cannot reach ${apiBase()}: ${e.cause?.code ?? e.message}`);
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', onAbort);
+  }
+}
+
+function run(cmd, args, opts = {}) {
+  const r = spawnSync(cmd, args, { encoding: 'utf8', timeout: 20_000, ...opts });
+  return { ok: !r.error && r.status === 0, out: (r.stdout ?? '').trim(), err: (r.stderr ?? '').trim(), missing: r.error?.code === 'ENOENT' };
+}
+
+const versionOf = (s) => (String(s).match(/\d+\.\d+\.\d+/) ?? [null])[0];
+function versionAtLeast(v, min) {
+  const a = v.split('.').map(Number);
+  const b = min.split('.').map(Number);
+  for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] > b[i];
+  return true;
+}
+
+/** Comparable form of a git remote: host/owner/repo, lower case, no scheme, user or .git. */
+function remoteId(url) {
+  return String(url)
+    .trim()
+    .replace(/^git@([^:]+):/, '$1/')
+    .replace(/^[a-z+]+:\/\/([^@/]+@)?/i, '')
+    .replace(/\.git$/, '')
+    .replace(/\/+$/, '')
+    .toLowerCase();
+}
+
+/** Whether Claude Code trusts the folder. A background session needs the folder itself trusted, not a parent. */
+function trusted(dir, claudeJson = readJson(CLAUDE_JSON)) {
+  return !!claudeJson?.projects?.[path.resolve(dir)]?.hasTrustDialogAccepted;
+}
+
+/** Marks folders trusted in ~/.claude.json (read, change, write to a temp file, rename). */
+function trust(dirs) {
+  const j = readJson(CLAUDE_JSON);
+  if (!j) return false;
+  j.projects ??= {};
+  for (const d of dirs) j.projects[d] = { ...(j.projects[d] ?? {}), hasTrustDialogAccepted: true };
+  const tmp = `${CLAUDE_JSON}.projectify-${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(j, null, 2));
+  fs.renameSync(tmp, CLAUDE_JSON);
+  return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// claude: background workers
+// ---------------------------------------------------------------------------------------------
+
+/** Background sessions Claude Code knows about, by id (`claude agents --json`, kind background). */
+function backgroundAgents() {
+  const r = run('claude', ['agents', '--json', '--all']);
+  if (!r.ok) return null;
+  try {
+    const all = JSON.parse(r.out);
+    return all.filter((a) => a.kind === 'background');
+  } catch {
+    return null;
+  }
+}
+const agentIds = (a) => [a.id, a.shortId, a.sessionId, a.name].filter(Boolean).map(String);
+const isDone = (a) => a.state === 'done' || a.status === 'exited' || a.status === 'stopped' || a.status === 'failed' || a.status === 'completed';
+/** Working, or waiting on a permission: not idle. A worker that worked and went idle has ended its turn for good. */
+const isBusy = (a) => a.state === 'working' || (a.status && a.status !== 'idle');
+
+/** Starts one worker; resolves with the id `claude --bg` printed. */
+function startWorker(fire) {
+  const args = ['--bg', '--no-chrome', '--worktree', fire.worktree, '--permission-mode', 'auto'];
+  if (fire.model) args.push('--model', fire.model);
+  args.push('--settings', JSON.stringify(workerSettings()));
+  args.push('--agent', process.env.PROJECTIFY_WORKER_AGENT || 'projectify:projectify-worker');
+  // plugin development: extra claude arguments as a JSON array, e.g. ["--plugin-dir", "~/src/projectify-plugin"]
+  if (process.env.PROJECTIFY_CLAUDE_ARGS) args.push(...JSON.parse(process.env.PROJECTIFY_CLAUDE_ARGS));
+  args.push(fire.payload);
+  return new Promise((resolve, reject) => {
+    let out = '';
+    let err = '';
+    const child = spawn('claude', args, { cwd: fire.repoPath, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ...WORKER_ENV } });
+    child.stdout.on('data', (d) => (out += d));
+    child.stderr.on('data', (d) => (err += d));
+    child.on('error', (e) => reject(new Error(e.code === 'ENOENT' ? 'claude is not on PATH' : e.message)));
+    child.on('close', (code) => {
+      if (code !== 0) return reject(new Error((err || out).trim().split('\n').pop() || `claude exited ${code}`));
+      // `claude --bg` prints "backgrounded · <id>" and the `claude attach <id>` / `stop <id>` lines
+      const text = out + '\n' + err;
+      const id = (text.match(/backgrounded\s*·\s*([0-9a-z]{6,})/i) ?? text.match(/claude (?:attach|logs|stop) ([0-9a-z]{6,})/i) ?? [])[1] ?? null;
+      log(`claude --bg printed: ${(out + err).trim().replace(/\s+/g, ' ')}`);
+      // without its agent the worker would run the payload as a plain session: stop it at once
+      const noAgent = text.match(/no agent named '([^']+)'/i);
+      if (noAgent) {
+        stopWorker(id).catch(() => {});
+        return reject(new Error(`Claude Code has no agent ${noAgent[1]}: update the plugin (/plugin update projectify@projectify)`));
+      }
+      resolve({ id, printed: out.trim() });
+    });
+  });
+}
+
+/** claude stop, then claude rm once the process has let go of its worktree lock (rm refuses while it runs). */
+async function stopWorker(id) {
+  if (!id) return;
+  const st = run('claude', ['stop', id]);
+  let rm;
+  for (let i = 0; i < 15; i++) {
+    rm = run('claude', ['rm', id]);
+    if (rm.ok && /^removed/m.test(rm.out)) break;
+    await sleep(1000);
+  }
+  log(`claude stop ${id}: ${st.out || st.err} · claude rm ${id}: ${(rm.out || rm.err).replace(/\s+/g, ' ')}`);
+}
+
+// ---------------------------------------------------------------------------------------------
+// fleet
+// ---------------------------------------------------------------------------------------------
+
+function parseFleetArgs(argv) {
+  const o = { keys: [], workers: null, untilEmpty: false, dryRun: false, now: false };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--workers' || a === '-n') o.workers = Number(argv[++i]);
+    else if (a.startsWith('--workers=')) o.workers = Number(a.slice(10));
+    else if (a === '--until-empty') o.untilEmpty = true;
+    else if (a === '--dry-run') o.dryRun = true;
+    else if (a === '--now') o.now = true;
+    else if (a.startsWith('-')) die(`unknown option ${a} (projectify help)`);
+    else o.keys.push(a.toUpperCase());
+  }
+  if (o.workers != null && !(Number.isInteger(o.workers) && o.workers >= 1)) die('--workers takes a whole number, 1 or more');
+  return o;
+}
+
+function printProjects(projects, skipped) {
+  for (const p of projects) say(`working ${p.key} · ${p.name} · ${untilde(p.repoPath)}`);
+  for (const s of skipped) say(`skipping ${s.key}${s.name ? ` · ${s.name}` : ''}: ${s.why}`);
+}
+
+/** --dry-run: what a fleet would take, in order, without starting one. */
+async function dryRun(o) {
+  const [machine, queue] = await Promise.all([api('GET', '/fleet/machine'), api('GET', `/fleet/queue${o.keys.length ? `?projects=${encodeURIComponent(o.keys.join(','))}` : ''}`)]);
+  const repo = new Map(machine.projects.map((p) => [p.key, p.repoPath]));
+  const claudeJson = readJson(CLAUDE_JSON);
+  const worked = [];
+  const skipped = [...queue.skippedProjects];
+  for (const p of queue.projects) {
+    const r = repo.get(p.key);
+    if (!r) skipped.push({ key: p.key, name: p.name, why: 'no repo for it on this machine (projectify setup-machine)' });
+    else if (!fs.existsSync(r)) skipped.push({ key: p.key, name: p.name, why: `its repo folder ${untilde(r)} is missing` });
+    else if (!trusted(r, claudeJson)) skipped.push({ key: p.key, name: p.name, why: `Claude Code does not trust ${untilde(r)} yet (projectify setup-machine)` });
+    else worked.push({ ...p, repoPath: r });
+  }
+  for (const k of o.keys) if (!repo.has(k) && !skipped.some((s) => s.key === k)) skipped.push({ key: k, name: null, why: 'no project with that key in this workspace' });
+  const cap = Math.min(o.workers ?? machine.machine.maxWorkers, machine.machine.maxWorkers);
+  console.log(`Dry run on ${machine.machine.label}: up to ${cap} worker${cap === 1 ? '' : 's'} at a time.`);
+  printProjects(worked, skipped);
+  const keys = new Set(worked.map((p) => p.key));
+  const tasks = queue.tasks.filter((t) => keys.has(t.project));
+  if (!tasks.length) console.log('Nothing ready to take.');
+  else {
+    console.log(`Would take, in order:`);
+    tasks.forEach((t, i) => console.log(`  ${String(i + 1).padStart(2)}. ${t.ref}  ${t.title}${t.size ? `  [${t.size}]` : ''}`));
+  }
+  const left = queue.leftOut.filter((l) => keys.has(l.ref.split('-')[0]));
+  if (left.length) {
+    console.log('Left out:');
+    for (const l of left.slice(0, 20)) console.log(`      ${l.ref}  ${l.why}`);
+    if (left.length > 20) console.log(`      … and ${left.length - 20} more`);
+  }
+}
+
+function saveState(s) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2));
+}
+const alive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+async function fleet(o) {
+  if (o.dryRun) return dryRun(o);
+  const prev = readJson(STATE_FILE);
+  if (prev?.pid && prev.pid !== process.pid && alive(prev.pid) && !prev.endedAt)
+    die(`a fleet already runs on this machine (pid ${prev.pid}). projectify fleet status shows it; projectify fleet stop ends it.`);
+
+  const start = await api('POST', '/fleet/start', { projects: o.keys.length ? o.keys : null, workers: o.workers, untilEmpty: o.untilEmpty, plugin_version: pluginVersion() });
+  printProjects(start.projects, start.skipped);
+  if (!start.fleet) die('no project to work: every one was skipped (above).');
+  const claudeJson = readJson(CLAUDE_JSON);
+  for (const p of start.projects)
+    if (!fs.existsSync(p.repoPath)) say(`warning: ${p.key}'s repo ${untilde(p.repoPath)} is missing; its tasks cannot start (projectify fleet doctor)`);
+    else if (claudeJson && !trusted(p.repoPath, claudeJson)) say(`warning: Claude Code does not trust ${untilde(p.repoPath)}, so ${p.key}'s workers cannot start (projectify setup-machine)`);
+  const fleetId = start.fleet.id;
+  say(`fleet ${fleetId.slice(-6)} on ${start.machine.label}: up to ${start.fleet.maxWorkers} worker${start.fleet.maxWorkers === 1 ? '' : 's'}${o.untilEmpty ? ', until nothing is left' : ''}. Ctrl-C: stop after current; twice: stop now.`);
+
+  /** fire id → { fire, bgId, task, since, last } */
+  const running = new Map();
+  const state = { pid: process.pid, fleet: fleetId, api: apiBase(), startedAt: new Date().toISOString(), projects: start.projects.map((p) => p.key), workers: [] };
+  const persist = () => saveState({ ...state, workers: [...running.values()].map((w) => ({ fire: w.fire.fire, task: w.fire.task, project: w.fire.project, worktree: w.fire.worktree, bgId: w.bgId, since: w.since })) });
+  persist();
+
+  let stopping = null; // 'after_current' | 'now'
+  let finished = false;
+  let lastWait = '';
+  const ac = new AbortController();
+
+  const endWorker = async (w, reason) => {
+    running.delete(w.fire.fire);
+    persist();
+    await stopWorker(w.bgId);
+    await api('POST', `/fleet/${fleetId}/workers/${w.fire.fire}/end`, { reason }).catch((e) => say(`could not report the end of ${w.fire.task ?? w.fire.fire}: ${e.message}`));
+  };
+
+  const finish = async (why) => {
+    if (finished) return;
+    finished = true;
+    ac.abort();
+    if (stopping === 'now') for (const w of [...running.values()]) await endWorker(w, 'stopped now');
+    say(`fleet stopped: ${why}`);
+    saveState({ ...state, endedAt: new Date().toISOString(), endReason: why, workers: [] });
+    process.exit(0);
+  };
+
+  process.on('SIGINT', async () => {
+    if (!stopping) {
+      stopping = 'after_current';
+      say(`stopping after the current task${running.size === 1 ? '' : 's'} (${running.size} running). Ctrl-C again to stop now.`);
+      ac.abort();
+      await api('POST', `/fleet/${fleetId}/stop`, { mode: 'after_current' }).catch((e) => say(`could not tell the board: ${e.message}`));
+      if (!running.size) await finish('stopped from the terminal');
+    } else {
+      stopping = 'now';
+      await api('POST', `/fleet/${fleetId}/stop`, { mode: 'now' }).catch(() => {});
+      await finish('stopped now from the terminal');
+    }
+  });
+  process.on('SIGTERM', () => process.emit('SIGINT'));
+
+  // heartbeat: what runs, every 30 s; it also carries a stop from the web app
+  const heartbeat = async () => {
+    const r = await api('POST', `/fleet/${fleetId}/heartbeat`, {
+      running: [...running.values()].map((w) => ({ fire: w.fire.fire, worker: w.bgId, task: w.fire.task, since: w.since, last: w.last ?? null })),
+      quota: quota(),
+    }).catch((e) => (say(`heartbeat failed: ${e.message}`), null));
+    if (r?.stopped) {
+      stopping = 'now';
+      await finish(r.reason ?? 'stopped from the board');
+    } else if (r?.stopRequested && !stopping) {
+      stopping = r.stopRequested === 'now' ? 'now' : 'after_current';
+      say(`the board asked to stop ${stopping === 'now' ? 'now' : 'after the current tasks'}`);
+      ac.abort();
+      if (stopping === 'now' || !running.size) await finish('stopped from the board');
+    }
+  };
+  const hb = setInterval(heartbeat, HEARTBEAT_MS);
+  hb.unref();
+
+  // watcher: a finished worker frees its slot
+  const watch = async () => {
+    if (!running.size) return;
+    const agents = backgroundAgents();
+    if (!agents) return;
+    for (const w of [...running.values()]) {
+      const a = agents.find((x) => w.bgId && agentIds(x).some((id) => id === w.bgId || id.startsWith(w.bgId)));
+      if (a) {
+        w.last = a.status ?? w.last;
+        w.seen = true;
+        if (isBusy(a)) w.worked = true;
+        // state blocked + status idle: the turn ended asking for a person, whom nobody watching a worker is
+        if (isDone(a) || (w.worked && !isBusy(a))) {
+          say(`${w.fire.task ?? w.fire.project} finished (${a.status ?? 'done'}); slot free`);
+          await endWorker(w, 'finished');
+        } else if (a.state === 'blocked' && !w.blockedSaid) {
+          w.blockedSaid = true;
+          say(`${w.fire.task ?? w.fire.project} is blocked: an approval in Needs you, or a prompt only the terminal shows (claude attach ${w.bgId})`);
+        }
+      } else if (w.seen || Date.now() - Date.parse(w.since) > 120_000) {
+        say(`${w.fire.task ?? w.fire.project} is gone from claude agents; slot free`);
+        await endWorker(w, 'gone');
+      }
+    }
+    if (stopping === 'after_current' && !running.size) await finish('stopped after the current tasks');
+  };
+  const wt = setInterval(() => watch().catch((e) => say(`watch failed: ${e.message}`)), WATCH_MS);
+  wt.unref();
+
+  // the loop: long-poll next, start a worker per fire
+  let backoff = 1000;
+  let startBackoff = 0; // after a worker fails to start, wait before taking the next task
+  while (!finished) {
+    if (stopping) {
+      await sleep(1000);
+      continue;
+    }
+    let r;
+    try {
+      r = await api('GET', `/fleet/${fleetId}/next?wait=${NEXT_WAIT_S}`, null, { signal: ac.signal, timeoutMs: (NEXT_WAIT_S + 20) * 1000 });
+      backoff = 1000;
+    } catch (e) {
+      if (stopping || finished) continue;
+      if (e.status === 401 || e.status === 403) die(e.message);
+      if (e.status === 404) await finish('the board no longer knows this fleet');
+      say(`${e.message}; trying again in ${Math.round(backoff / 1000)} s`);
+      await sleep(backoff);
+      backoff = Math.min(backoff * 2, 60_000);
+      continue;
+    }
+    if (r.kind === 'stop') {
+      stopping = stopping ?? 'after_current';
+      if (!running.size) await finish(r.reason);
+      say(`the board says stop: ${r.reason}. Waiting for ${running.size} running.`);
+      continue;
+    }
+    if (r.kind === 'wait') {
+      const line = `waiting: ${r.why} (${r.running} running)`;
+      if (line !== lastWait) say(line);
+      lastWait = line;
+      if (o.untilEmpty && r.running === 0 && running.size === 0 && /^0 ready/.test(r.why) && r.queued === 0) {
+        await api('POST', `/fleet/${fleetId}/stop`, { mode: 'now' }).catch(() => {});
+        await finish('nothing left to take (--until-empty)');
+      }
+      continue;
+    }
+    // a fire
+    lastWait = '';
+    const label = r.task ?? `${r.project} (${r.event})`;
+    if (!r.repoPath || !fs.existsSync(r.repoPath)) {
+      startBackoff = Math.min(Math.max(startBackoff * 2, 30_000), 300_000);
+      say(`cannot start ${label}: its repo ${r.repoPath ? untilde(r.repoPath) + ' is missing' : 'is not recorded on this machine'} (next try in ${Math.round(startBackoff / 1000)} s)`);
+      await api('POST', `/fleet/${fleetId}/workers/${r.fire}/end`, { reason: 'no repo on this machine' }).catch(() => {});
+      for (const until = Date.now() + startBackoff; Date.now() < until && !stopping && !finished; ) await sleep(1000);
+      continue;
+    }
+    const since = new Date().toISOString();
+    try {
+      const w = await startWorker(r);
+      startBackoff = 0;
+      running.set(r.fire, { fire: r, bgId: w.id, since, last: 'started' });
+      persist();
+      say(`started ${label} in worktree ${r.worktree}${r.model ? ` on ${r.model}` : ''}${w.id ? ` (claude ${w.id})` : ''}`);
+      await api('POST', `/fleet/${fleetId}/workers`, { fire: r.fire, claude_bg_id: w.id }).catch((e) => say(`could not report ${label} started: ${e.message}`));
+    } catch (e) {
+      startBackoff = Math.min(Math.max(startBackoff * 2, 30_000), 300_000);
+      say(`could not start ${label}: ${e.message} (next try in ${Math.round(startBackoff / 1000)} s)`);
+      await api('POST', `/fleet/${fleetId}/workers/${r.fire}/end`, { reason: `could not start: ${e.message}`.slice(0, 200) }).catch(() => {});
+      for (const until = Date.now() + startBackoff; Date.now() < until && !stopping && !finished; ) await sleep(1000);
+    }
+  }
+}
+
+async function status() {
+  const s = readJson(STATE_FILE);
+  if (!s) return console.log('No fleet has run on this machine yet. Start one with: projectify fleet');
+  const live = s.pid && alive(s.pid) && !s.endedAt;
+  if (!live) {
+    console.log(`No fleet runs here now. The last one (${s.fleet.slice(-6)}) worked ${s.projects.join(', ')} from ${s.startedAt}${s.endedAt ? ` until ${s.endedAt}: ${s.endReason}` : ' and ended without saying why'}.`);
+    return;
+  }
+  console.log(`Fleet ${s.fleet.slice(-6)} runs (pid ${s.pid}) since ${s.startedAt}, working ${s.projects.join(', ')}.`);
+  if (!s.workers.length) console.log('No worker running: it waits for ready tasks.');
+  const agents = backgroundAgents() ?? [];
+  for (const w of s.workers) {
+    const a = agents.find((x) => w.bgId && agentIds(x).some((id) => id.startsWith(w.bgId)));
+    const mins = Math.round((Date.now() - Date.parse(w.since)) / 60000);
+    console.log(`  ${w.task ?? w.project}  worktree ${w.worktree}  ${mins} min  ${a ? `${a.status ?? ''}${a.state ? `, ${a.state}` : ''}` : 'not in claude agents'}${w.bgId ? `  (claude attach ${w.bgId})` : ''}`);
+  }
+  console.log(`Log: ${untilde(LOG_FILE)}`);
+}
+
+async function stop(o) {
+  const s = readJson(STATE_FILE);
+  if (!s || s.endedAt || !s.pid || !alive(s.pid)) return console.log('No fleet runs on this machine.');
+  const mode = o.now ? 'now' : 'after_current';
+  await api('POST', `/fleet/${s.fleet}/stop`, { mode }).catch((e) => console.log(`could not tell the board (${e.message}); stopping the launcher anyway`));
+  process.kill(s.pid, 'SIGINT');
+  if (o.now) {
+    await sleep(300);
+    if (alive(s.pid)) process.kill(s.pid, 'SIGINT');
+  }
+  console.log(o.now ? 'Stopping now: running workers are stopped.' : 'Stopping after the current tasks. projectify fleet stop --now stops them too.');
+}
+
+// ---------------------------------------------------------------------------------------------
+// doctor
+// ---------------------------------------------------------------------------------------------
+
+async function doctor() {
+  const checks = [];
+  const check = (name, ok, detail, fix) => checks.push({ name, ok: !!ok, detail: detail ?? null, fix: ok ? null : fix ?? null });
+
+  const nodeMajor = Number(process.versions.node.split('.')[0]);
+  check('Node', nodeMajor >= MIN_NODE, `node ${process.versions.node}`, `Install Node ${MIN_NODE} or later (brew install node).`);
+
+  const cv = run('claude', ['--version']);
+  const claudeV = cv.ok ? versionOf(cv.out) : null;
+  check(
+    'Claude Code',
+    claudeV && versionAtLeast(claudeV, MIN_CLAUDE),
+    claudeV ? `claude ${claudeV}` : cv.missing ? 'claude is not on PATH' : cv.err,
+    claudeV ? `Update Claude Code to ${MIN_CLAUDE} or later: claude update` : 'Install Claude Code: https://claude.com/claude-code',
+  );
+
+  const installed = readJson(path.join(os.homedir(), '.claude', 'plugins', 'installed_plugins.json'))?.plugins?.['projectify@projectify'];
+  const inst = Array.isArray(installed) ? installed[0] : installed;
+  const mine = pluginVersion();
+  check(
+    'Projectify plugin',
+    inst ? inst.version === mine || !inst.version : process.env.PROJECTIFY_DEV,
+    inst ? `installed ${inst.version ?? '?'}, this launcher ${mine}` : `not installed (this launcher ${mine} runs from ${untilde(PLUGIN_ROOT)})`,
+    inst ? 'Run /plugin update projectify@projectify in Claude Code, then projectify setup-machine for a fresh shim.' : 'In Claude Code: /plugin install projectify@projectify',
+  );
+
+  let machine = null;
+  const t = token();
+  if (!t) check('Machine token', false, `no token at ${untilde(TOKEN_FILE)}`, 'Run /projectify:setup in Claude Code on this machine.');
+  else
+    try {
+      machine = await api('GET', '/fleet/machine');
+      check('Machine token', true, `${machine.machine.label} at ${apiBase()}`);
+    } catch (e) {
+      check('Machine token', false, e.message, e.status ? 'The token is unknown or revoked: run /projectify:setup again on this machine.' : `Check the network, or PROJECTIFY_API (now ${apiBase()}).`);
+    }
+
+  const mcp = run('claude', ['mcp', 'get', 'plugin:projectify:projectify'], { timeout: 30_000 });
+  const mcpText = `${mcp.out}\n${mcp.err}`;
+  const signedIn = mcp.ok && !/needs auth|not authenticated|failed/i.test(mcpText);
+  check('Projectify MCP sign-in', signedIn, signedIn ? 'connected' : (mcpText.match(/Status:\s*(.+)/i)?.[1] ?? mcpText.split('\n')[0]).trim() || 'not found', 'In Claude Code: /mcp → plugin:projectify:projectify → Authenticate (or claude mcp login plugin:projectify:projectify).');
+
+  const gh = run('gh', ['auth', 'status']);
+  check('GitHub CLI', gh.ok, gh.missing ? 'gh is not installed' : gh.ok ? 'signed in' : 'not signed in', gh.missing ? 'brew install gh, then gh auth login (workers open PRs with it).' : 'gh auth login');
+
+  if (machine) {
+    const claudeJson = readJson(CLAUDE_JSON);
+    const on = machine.projects.filter((p) => p.fleet);
+    if (!on.length) check('Projects', false, 'the fleet is off for every project', 'Switch the fleet on for a project in Projectify: Workspace › Fleet.');
+    for (const p of on) {
+      const n = `${p.key} repo`;
+      if (!p.repoPath) {
+        check(n, false, 'no repo path on this machine', `cd into the ${p.key} repo and run projectify setup-machine . (or /projectify:setup there).`);
+        continue;
+      }
+      if (!fs.existsSync(p.repoPath)) {
+        check(n, false, `${untilde(p.repoPath)} is missing`, `Clone the repo there, or run projectify setup-machine in its new folder.`);
+        continue;
+      }
+      const remote = run('git', ['-C', p.repoPath, 'remote', 'get-url', 'origin']);
+      if (!remote.ok) {
+        check(n, false, `${untilde(p.repoPath)} has no origin remote`, `git -C ${untilde(p.repoPath)} remote add origin <url>`);
+        continue;
+      }
+      if (!trusted(p.repoPath, claudeJson)) {
+        check(n, false, `Claude Code does not trust ${untilde(p.repoPath)}`, `projectify setup-machine ${untilde(p.repoPath)} (or open claude there once and accept).`);
+        continue;
+      }
+      const head = run('git', ['-C', p.repoPath, 'ls-remote', '--symref', 'origin', 'HEAD'], { timeout: 20_000 });
+      const branch = head.out.match(/refs\/heads\/(\S+)\s+HEAD/)?.[1];
+      check(n, head.ok && branch, head.ok ? `${untilde(p.repoPath)}, default branch ${branch ?? '?'}` : `cannot reach origin of ${untilde(p.repoPath)}`, `Check git access: git -C ${untilde(p.repoPath)} fetch origin`);
+    }
+  }
+
+  const width = Math.max(...checks.map((c) => c.name.length));
+  for (const c of checks) {
+    console.log(`${c.ok ? '✓' : '✗'} ${c.name.padEnd(width)}  ${c.detail ?? ''}`);
+    if (!c.ok && c.fix) console.log(`  ${' '.repeat(width)}  fix: ${c.fix}`);
+  }
+  const failed = checks.filter((c) => !c.ok).length;
+  console.log(failed ? `\n${failed} to fix.` : '\nAll good: projectify fleet');
+  if (machine) await api('POST', '/fleet/doctor', { checks, version: mine }).catch(() => {});
+  process.exitCode = failed ? 1 : 0;
+}
+
+// ---------------------------------------------------------------------------------------------
+// setup-machine
+// ---------------------------------------------------------------------------------------------
+
+/** Git repos (checkouts, not worktrees) in the folder itself and one level down. */
+function findRepos(folder) {
+  const out = [];
+  const consider = (dir) => {
+    try {
+      if (!fs.statSync(path.join(dir, '.git')).isDirectory()) return; // a worktree has a .git file
+    } catch {
+      return;
+    }
+    const r = run('git', ['-C', dir, 'remote', 'get-url', 'origin']);
+    if (r.ok && r.out) out.push({ path: dir, remote: r.out });
+  };
+  consider(folder);
+  let entries = [];
+  try {
+    entries = fs.readdirSync(folder, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const e of entries) if (e.isDirectory() && !e.name.startsWith('.')) consider(path.join(folder, e.name));
+  return out;
+}
+
+function installShim() {
+  const target = path.join(PLUGIN_ROOT, 'bin', 'projectify');
+  // the shim follows plugin updates: it runs the installed plugin's launcher, else this one
+  const shim = `#!/bin/sh
+# projectify launcher shim (written by projectify setup-machine)
+p=$(node -e 'try{const j=require(process.env.HOME+"/.claude/plugins/installed_plugins.json").plugins["projectify@projectify"];const i=Array.isArray(j)?j[0]:j;i&&i.installPath&&process.stdout.write(i.installPath)}catch{}' 2>/dev/null)
+if [ -n "$p" ] && [ -f "$p/bin/projectify" ]; then exec node "$p/bin/projectify" "$@"; fi
+exec node ${JSON.stringify(target)} "$@"
+`;
+  fs.mkdirSync(path.dirname(SHIM), { recursive: true });
+  fs.writeFileSync(SHIM, shim, { mode: 0o755 });
+  const onPath = (process.env.PATH ?? '').split(path.delimiter).includes(path.dirname(SHIM));
+  say(`shim: ${untilde(SHIM)}${onPath ? '' : ` (add ${untilde(path.dirname(SHIM))} to your PATH: echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc)`}`);
+}
+
+async function setupMachine(argv) {
+  const dry = argv.includes('--dry-run');
+  const folders = argv.filter((a) => !a.startsWith('-'));
+  const roots = (folders.length ? folders : DEFAULT_FOLDERS).map((f) => path.resolve(tilde(f))).filter((f) => fs.existsSync(f));
+  if (!dry) installShim();
+  if (!roots.length) die(`none of these folders exist: ${(folders.length ? folders : DEFAULT_FOLDERS).join(', ')}. Name the folders your repos live in: projectify setup-machine ~/src`);
+  const repos = roots.flatMap(findRepos);
+  say(`found ${repos.length} repo${repos.length === 1 ? '' : 's'} under ${roots.map(untilde).join(', ')}`);
+  if (!repos.length) return;
+  const r = await api('POST', '/fleet/repos', { repos, dry_run: dry });
+  const toTrust = [];
+  const claudeJson = readJson(CLAUDE_JSON);
+  for (const m of r.repos) {
+    if (m.decision === 'recorded' || m.decision === 'unchanged') {
+      const t = trusted(m.path, claudeJson);
+      if (!t) toTrust.push(m.path);
+      say(`${m.project}  ${untilde(m.path)}  ${m.decision === 'recorded' ? (dry ? 'would record' : 'recorded') : 'already recorded'}${t ? '' : dry ? ', would trust' : ', trusted'}`);
+    } else if (m.decision === 'refused') say(`${m.project}  ${untilde(m.path)}  not recorded: ${m.why}`);
+    else if (m.decision === 'ambiguous') say(`??   ${untilde(m.path)}  matches several projects (${m.candidates.join(', ')}): record it from Claude Code with /projectify:setup in that repo`);
+  }
+  const none = r.repos.filter((m) => m.decision === 'none').length;
+  if (none) say(`${none} repo${none === 1 ? ' is' : 's are'} not in Projectify (left alone)`);
+  if (toTrust.length && !dry && !trust(toTrust)) say(`could not trust the repos in ${untilde(CLAUDE_JSON)}: open claude in each once and accept the trust prompt`);
+  if (!dry) console.log('\nNext: projectify fleet doctor');
+}
+
+// ---------------------------------------------------------------------------------------------
+
+const HELP = `projectify ${pluginVersion()}: the Projectify fleet launcher
+
+  projectify fleet [KEYS…] [--workers N] [--until-empty] [--dry-run]
+      Work every project with the fleet on and a repo on this machine, or only KEYS.
+      Ctrl-C once stops after the current tasks, twice stops now.
+  projectify fleet doctor            Check this machine and every fleet project, one fix line each
+  projectify fleet status            What the fleet on this machine is doing
+  projectify fleet stop [--now]      Stop it after the current tasks (or now)
+  projectify setup-machine [DIRS…]   Put projectify on your PATH, find your project repos under DIRS
+                                     (default ${DEFAULT_FOLDERS.join(' ')}), record and trust them
+
+API ${apiBase()} · token ${untilde(TOKEN_FILE)} · log ${untilde(LOG_FILE)}`;
+
+async function main() {
+  const [cmd, ...rest] = process.argv.slice(2);
+  if (Number(process.versions.node.split('.')[0]) < MIN_NODE) die(`needs Node ${MIN_NODE} or later (this is ${process.versions.node})`);
+  if (cmd === 'fleet') {
+    const sub = rest[0];
+    if (sub === 'doctor') return doctor();
+    if (sub === 'status') return status();
+    if (sub === 'stop') return stop(parseFleetArgs(rest.slice(1)));
+    return fleet(parseFleetArgs(rest));
+  }
+  if (cmd === 'setup-machine') return setupMachine(rest);
+  if (cmd === 'doctor') return doctor();
+  if (cmd === 'version' || cmd === '--version' || cmd === '-v') return console.log(pluginVersion());
+  console.log(HELP);
+  if (cmd && cmd !== 'help' && cmd !== '--help' && cmd !== '-h') process.exitCode = 1;
+}
+
+main().catch((e) => die(e.message));

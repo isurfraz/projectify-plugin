@@ -21,3 +21,12 @@ Set me up in Projectify using the Projectify tools. Keep every message short.
 6. Tell me what was made and the next steps, each in one line, as the replies give them. If the reply carries repo files, offer to write them into this repo (merge into what is there) and commit them; then suggest `/mcp__projectify__onboard_project <KEY>` to fill the Brief from the code.
 
 Never create a project or invite anyone before my yes in step 4. If a tool says only owners can do something, stop and tell me. If a tool asks for a chat key, call start_session and pass its key.
+
+## The fleet on this machine (optional)
+
+Then ask ONE multiple-choice question: "Set up the fleet on this machine, so `projectify fleet` can work ready tasks in the background?" with "Yes" and "Not now". On "Not now", stop here. On yes, do these in order and keep each message to a line:
+
+7. Run `hostname`, then `act("mint_hook_token", { hostname })`. Write the token it returns, and nothing else, to `~/.claude/plugins/data/projectify-projectify/token` with one Bash command (`umask 077; mkdir -p ~/.claude/plugins/data/projectify-projectify; printf %s '<token>' > ~/.claude/plugins/data/projectify-projectify/token`). Never show the token in chat or write it anywhere else.
+8. Run `node "${CLAUDE_PLUGIN_ROOT}/bin/projectify" setup-machine` (add the folders my repos live in if they are not under ~/Documents/GitHub or ~/code; ask me only if it finds none). It puts `projectify` on my PATH, records each repo for its project and marks it trusted for Claude Code. Tell me what it recorded.
+9. Run `projectify fleet doctor` (or `node "${CLAUDE_PLUGIN_ROOT}/bin/projectify" fleet doctor` when ~/.local/bin is not on my PATH yet). For each ✗ line, tell me its fix in a line. Two fixes are mine, in a terminal: signing the plugin's server in (`/mcp` → plugin:projectify:projectify → Authenticate) and `gh auth login`.
+10. Finish with: switch the fleet on for a project in Projectify (Workspace › Fleet, or the project's Setup › Fleet), then run `projectify fleet` in a terminal.
