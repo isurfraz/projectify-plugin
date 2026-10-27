@@ -1,6 +1,6 @@
 {
   "name": "projectify",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Projectify for Claude Code: the board tools, a SessionStart hook that opens the right project, and skills to plan, pick up and hand off work.",
   "author": {
     "name": "Projectify",

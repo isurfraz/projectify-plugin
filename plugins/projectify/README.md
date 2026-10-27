@@ -18,3 +18,4 @@ For Claude Code on the web and cloud sessions, add Projectify as a connector on 
 - The Projectify MCP server (https://api.projectify.si/mcp).
 - A SessionStart hook: in any git repo it names the remote so Claude finds the project; quiet where the repo has its own Projectify hook.
 - Skills: `projectify`, `projectify-plan`, `projectify-next`, `projectify-handoff`.
+- `/projectify:setup`: a few skippable questions, then Claude sets up your workspace and first project.
