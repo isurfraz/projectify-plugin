@@ -65,6 +65,12 @@ const READ_ONLY_DISALLOWED = 'Edit,Write,NotebookEdit';
 /** The round a fire carries: the field, else its payload's round= line, else 0. */
 const roundOf = (fire) => Number(fire?.round ?? (String(fire?.payload ?? '').match(/^round=(\d+)/m) ?? [])[1] ?? 0) || 0;
 /** The terminal name of a fire: "developer SPM-12 (rework on spm-12-x)", "reviewer SPM-12 round 1", "coordinator: 3 items". */
+/** SPM-508: "on opus, effort high" for the started line and fleet status; empty when the worker runs on its defaults. */
+function modelText(fire) {
+  const parts = [fire.model ? `on ${fire.model}` : null, fire.effort ? `effort ${fire.effort}` : null, fire.fallbackModel ? `fallback ${fire.fallbackModel}` : null].filter(Boolean);
+  return parts.join(', ');
+}
+
 function fireLabel(fire, inbox) {
   const role = roleOf(fire);
   if (role === 'coordinator') {
@@ -238,6 +244,9 @@ const isBusy = (a) => a.state === 'working' || (a.status && a.status !== 'idle')
 function startWorker(fire) {
   const args = ['--bg', '--no-chrome', '--worktree', fire.worktree, '--permission-mode', 'auto'];
   if (fire.model) args.push('--model', fire.model);
+  // SPM-508 (D-090): an older API sends neither: no flag, the worker's own default
+  if (fire.effort) args.push('--effort', fire.effort);
+  if (fire.fallbackModel) args.push('--fallback-model', fire.fallbackModel);
   const role = roleOf(fire);
   if (READ_ONLY_ROLES.has(role)) args.push('--disallowedTools', READ_ONLY_DISALLOWED);
   args.push('--settings', JSON.stringify(workerSettings()));
@@ -412,7 +421,7 @@ async function fleet(o) {
   const running = new Map();
   const state = { pid: process.pid, fleet: fleetId, api: apiBase(), startedAt: new Date().toISOString(), projects: start.projects.map((p) => p.key), whenIdle, inbox: null, workers: [] };
   const persist = () =>
-    saveState({ ...state, workers: [...running.values()].map((w) => ({ fire: w.fire.fire, role: roleOf(w.fire), label: w.label, task: w.fire.task, project: w.fire.project, worktree: w.fire.worktree, branch: w.fire.branch ?? null, bgId: w.bgId, since: w.since })) });
+    saveState({ ...state, workers: [...running.values()].map((w) => ({ fire: w.fire.fire, role: roleOf(w.fire), label: w.label, task: w.fire.task, project: w.fire.project, worktree: w.fire.worktree, branch: w.fire.branch ?? null, model: w.fire.model ?? null, effort: w.fire.effort ?? null, fallbackModel: w.fire.fallbackModel ?? null, bgId: w.bgId, since: w.since })) });
   persist();
 
   let stopping = null; // 'after_current' | 'now'
@@ -560,7 +569,7 @@ async function fleet(o) {
       startBackoff = 0;
       running.set(r.fire, { fire: r, label, bgId: w.id, since, last: 'started' });
       persist();
-      say(`started ${label} in worktree ${r.worktree}${r.model ? ` on ${r.model}` : ''}${w.id ? ` (claude ${w.id})` : ''}`);
+      say(`started ${label} in worktree ${r.worktree}${modelText(r) ? ` ${modelText(r)}` : ''}${w.id ? ` (claude ${w.id})` : ''}`);
       await api('POST', `/fleet/${fleetId}/workers`, { fire: r.fire, claude_bg_id: w.id }).catch((e) => say(`could not report ${label} started: ${e.message}`));
     } catch (e) {
       startBackoff = Math.min(Math.max(startBackoff * 2, 30_000), 300_000);
@@ -585,7 +594,7 @@ async function status() {
   const detail = (w) => {
     const a = agents.find((x) => w.bgId && agentIds(x).some((id) => id.startsWith(w.bgId)));
     const mins = Math.round((Date.now() - Date.parse(w.since)) / 60000);
-    return `worktree ${w.worktree}  ${mins} min  ${a ? `${a.status ?? ''}${a.state ? `, ${a.state}` : ''}` : 'not in claude agents'}${w.bgId ? `  (claude attach ${w.bgId})` : ''}`;
+    return `worktree ${w.worktree}${modelText(w) ? `  ${modelText(w)}` : ''}  ${mins} min  ${a ? `${a.status ?? ''}${a.state ? `, ${a.state}` : ''}` : 'not in claude agents'}${w.bgId ? `  (claude attach ${w.bgId})` : ''}`;
   };
   // SPM-503: the Coordinator, and its inbox as the last wait from the board counted it
   const coord = s.workers.find((w) => w.role === 'coordinator');

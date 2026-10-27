@@ -27,7 +27,7 @@ The fleet is optional and for Claude Code in a terminal. Workers run on your mac
 
 1. **Install or update the plugin** in Claude Code: the two commands above, or `/plugin update projectify@projectify`. You need Node 18 or later and the GitHub CLI (`gh auth login`); workers open their pull requests with it.
 2. **Set up this machine:** run `/projectify:setup` in any repo and say yes to the fleet. It saves this machine's token, runs `projectify setup-machine` (puts `projectify` in `~/.local/bin`, finds your project repos under `~/Documents/GitHub` and `~/code`, records and trusts each one) and ends with `projectify fleet doctor`. Repos somewhere else: `projectify setup-machine ~/src`.
-3. **Switch projects on** in the web app: People › Fleet has a switch per project (projects start off) and each machine's worker cap. A project's Setup › Fleet sets its limits, triggers and the model for each step. On a task, "Keep the fleet off this task" leaves it out, and Give to my fleet sends it next.
+3. **Switch projects on** in the web app: People › Fleet has a switch per project (projects start off) and each machine's worker cap. A project's Setup › Fleet sets its limits, triggers, and the model and effort per role (with developer rules by task size or kind); People › Fleet › My defaults sets yours, and a fallback model. The launcher passes them as --model, --effort and --fallback-model. On a task, "Keep the fleet off this task" leaves it out, and Give to my fleet sends it next.
 4. **Run it** in a terminal:
 
 ```
