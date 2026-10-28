@@ -338,6 +338,9 @@ function parseFleetArgs(argv) {
   return o;
 }
 
+/** SPM-587: the Coordinator's session ends when its inbox is empty, but it stays on duty and wakes on the next item. */
+const COORDINATOR_IDLE = 'Coordinator: inbox handled; still on duty, it wakes on the next question, approval or comment';
+
 /** " · roles: developer, reviewer, coordinator" when the API sends a project's roles (SPM-503), else nothing. */
 const rolesText = (roles) => {
   if (!roles || typeof roles !== 'object') return '';
@@ -419,7 +422,9 @@ async function fleet(o) {
 
   /** fire id → { fire, bgId, task, since, last } */
   const running = new Map();
-  const state = { pid: process.pid, fleet: fleetId, api: apiBase(), startedAt: new Date().toISOString(), projects: start.projects.map((p) => p.key), whenIdle, inbox: null, workers: [] };
+  // SPM-587: whether a Coordinator is on duty for this run (any project with it on); it runs only while its inbox has items
+  const coordinatorOn = start.projects.some((p) => p.roles && p.roles.coordinator);
+  const state = { pid: process.pid, fleet: fleetId, api: apiBase(), startedAt: new Date().toISOString(), projects: start.projects.map((p) => p.key), whenIdle, coordinatorOn, inbox: null, workers: [] };
   const persist = () =>
     saveState({ ...state, workers: [...running.values()].map((w) => ({ fire: w.fire.fire, role: roleOf(w.fire), label: w.label, task: w.fire.task, project: w.fire.project, worktree: w.fire.worktree, branch: w.fire.branch ?? null, model: w.fire.model ?? null, effort: w.fire.effort ?? null, fallbackModel: w.fire.fallbackModel ?? null, bgId: w.bgId, since: w.since })) });
   persist();
@@ -494,14 +499,14 @@ async function fleet(o) {
         if (isBusy(a)) w.worked = true;
         // state blocked + status idle: the turn ended asking for a person, whom nobody watching a worker is
         if (isDone(a) || (w.worked && !isBusy(a))) {
-          say(`${w.label} finished (${a.status ?? 'done'})${roleOf(w.fire) === 'coordinator' ? '' : '; slot free'}`);
+          say(roleOf(w.fire) === 'coordinator' ? COORDINATOR_IDLE : `${w.label} finished (${a.status ?? 'done'}); slot free`);
           await endWorker(w, 'finished');
         } else if (a.state === 'blocked' && !w.blockedSaid) {
           w.blockedSaid = true;
           say(`${w.label} is blocked: an approval in Needs you, or a prompt only the terminal shows (claude attach ${w.bgId})`);
         }
       } else if (w.seen || Date.now() - Date.parse(w.since) > 120_000) {
-        say(`${w.label} is gone from claude agents${roleOf(w.fire) === 'coordinator' ? '' : '; slot free'}`);
+        say(roleOf(w.fire) === 'coordinator' ? `Coordinator's session is gone from claude agents; ${COORDINATOR_IDLE.slice('Coordinator: '.length)}` : `${w.label} is gone from claude agents; slot free`);
         await endWorker(w, 'gone');
       }
     }
@@ -569,7 +574,7 @@ async function fleet(o) {
       startBackoff = 0;
       running.set(r.fire, { fire: r, label, bgId: w.id, since, last: 'started' });
       persist();
-      say(`started ${label} in worktree ${r.worktree}${modelText(r) ? ` ${modelText(r)}` : ''}${w.id ? ` (claude ${w.id})` : ''}`);
+      say(`${roleOf(r) === 'coordinator' ? 'Coordinator woke for its inbox' : `started ${label}`} in worktree ${r.worktree}${modelText(r) ? ` ${modelText(r)}` : ''}${w.id ? ` (claude ${w.id})` : ''}`);
       await api('POST', `/fleet/${fleetId}/workers`, { fire: r.fire, claude_bg_id: w.id }).catch((e) => say(`could not report ${label} started: ${e.message}`));
     } catch (e) {
       startBackoff = Math.min(Math.max(startBackoff * 2, 30_000), 300_000);
@@ -599,7 +604,10 @@ async function status() {
   // SPM-503: the Coordinator, and its inbox as the last wait from the board counted it
   const coord = s.workers.find((w) => w.role === 'coordinator');
   const inbox = typeof s.inbox === 'number' ? `${s.inbox} open item${s.inbox === 1 ? '' : 's'} in its inbox at the last check` : 'inbox count not known yet';
-  console.log(`Coordinator: ${coord ? `running  ${detail(coord)}` : 'not running'} · ${inbox}`);
+  // SPM-587: the Coordinator stays on duty for the whole run; its Claude session runs only while its inbox has items
+  if (coord) console.log(`Coordinator: on duty, handling its inbox now  ${detail(coord)} · ${inbox}`);
+  else if (s.coordinatorOn !== false) console.log(`Coordinator: on duty, idle until the next question, approval or comment · ${inbox}`);
+  else console.log('Coordinator: off for these projects (Setup › Fleet › Roles)');
   const workers = s.workers.filter((w) => w.role !== 'coordinator');
   if (!workers.length) console.log('No worker running: it waits for ready tasks.');
   for (const w of workers) console.log(`  ${w.label ?? `${w.role ?? 'developer'} ${w.task ?? w.project}`}  ${detail(w)}`);
