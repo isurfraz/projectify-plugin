@@ -10,6 +10,7 @@
 // The launcher long-polls the board over HTTPS with this machine's token, so waiting for work costs no
 // Claude tokens, and starts one `claude --bg --worktree` session per fire in the project's repo. A fire has a role
 // (SPM-503, Fleet 3): planner and developer run the worker agent, reviewer and coordinator their own read-only agents.
+// SPM-590 (Fleet 4): a land fire (role coordinator, event land) merges the passed PRs of the merge queue in one push to main.
 'use strict';
 
 const fs = require('node:fs');
@@ -44,6 +45,23 @@ const DEFAULT_WORKER_SETTINGS = {
 };
 /** worker-settings.json in the data folder adds to (or replaces keys of) the defaults. */
 const workerSettings = () => ({ ...DEFAULT_WORKER_SETTINGS, ...(readJson(path.join(DATA_DIR, 'worker-settings.json')) ?? {}) });
+/**
+ * SPM-590 (Fleet 4): a land worker's one job is the push to main, which the project's merging setting allowed: the
+ * default ask rules for it go and the fast-forward push is allowed. Force pushes still ask.
+ */
+const LAND_PUSH = ['Bash(git push origin HEAD:main)', 'Bash(git push origin HEAD:main:*)'];
+function landSettings() {
+  const s = workerSettings();
+  const perms = s.permissions ?? {};
+  return {
+    ...s,
+    permissions: {
+      ...perms,
+      ask: (perms.ask ?? []).filter((r) => !LAND_PUSH.includes(r) && r !== 'Bash(git push origin main:*)'),
+      allow: [...new Set([...(perms.allow ?? []), ...LAND_PUSH])],
+    },
+  };
+}
 // Workers load no claude.ai connectors (§11a.7: they were most of a worker's ~61k baseline); the plugin's own server stays.
 const WORKER_ENV = { ENABLE_CLAUDEAI_MCP_SERVERS: 'false' };
 /** Plan use the worker statusline last wrote (SPM-480), for the heartbeat's quota stop. */
@@ -62,6 +80,12 @@ const ROLE_AGENTS = {
 /** Reviewer and Coordinator read and comment; they never change files. */
 const READ_ONLY_ROLES = new Set(['reviewer', 'coordinator']);
 const READ_ONLY_DISALLOWED = 'Edit,Write,NotebookEdit';
+/** SPM-590: a land fire: the Coordinator agent landing the merge queue in one push to main. */
+const isLand = (fire) => fire?.event === 'land';
+/** A land fire's PRs: the field, else its payload's land= lines. */
+const landOf = (fire) =>
+  Array.isArray(fire?.land) ? fire.land : String(fire?.payload ?? '').split('\n').filter((l) => l.startsWith('land=')).map((l) => ({ task: l.slice(5).split(' ')[0] }));
+const prs = (n) => `${n} PR${n === 1 ? '' : 's'}`;
 /** The round a fire carries: the field, else its payload's round= line, else 0. */
 const roundOf = (fire) => Number(fire?.round ?? (String(fire?.payload ?? '').match(/^round=(\d+)/m) ?? [])[1] ?? 0) || 0;
 /** The terminal name of a fire: "developer SPM-12 (rework on spm-12-x)", "reviewer SPM-12 round 1", "coordinator: 3 items". */
@@ -73,6 +97,7 @@ function modelText(fire) {
 
 function fireLabel(fire, inbox) {
   const role = roleOf(fire);
+  if (isLand(fire)) return `land ${fire.project}: ${prs(landOf(fire).length)}`;
   if (role === 'coordinator') {
     const n = typeof fire.inbox === 'number' ? fire.inbox : inbox;
     return `coordinator${n ? `: ${n} item${n === 1 ? '' : 's'}` : ''}`;
@@ -249,7 +274,7 @@ function startWorker(fire) {
   if (fire.fallbackModel) args.push('--fallback-model', fire.fallbackModel);
   const role = roleOf(fire);
   if (READ_ONLY_ROLES.has(role)) args.push('--disallowedTools', READ_ONLY_DISALLOWED);
-  args.push('--settings', JSON.stringify(workerSettings()));
+  args.push('--settings', JSON.stringify(isLand(fire) ? landSettings() : workerSettings()));
   args.push('--agent', ROLE_AGENTS[role]());
   // plugin development: extra claude arguments as a JSON array, e.g. ["--plugin-dir", "~/src/projectify-plugin"]
   if (process.env.PROJECTIFY_CLAUDE_ARGS) args.push(...JSON.parse(process.env.PROJECTIFY_CLAUDE_ARGS));
@@ -344,7 +369,7 @@ const COORDINATOR_IDLE = 'Coordinator: inbox handled; still on duty, it wakes on
 /** " · roles: developer, reviewer, coordinator" when the API sends a project's roles (SPM-503), else nothing. */
 const rolesText = (roles) => {
   if (!roles || typeof roles !== 'object') return '';
-  const on = ['reviewer', 'coordinator'].filter((r) => roles[r]);
+  const on = ['reviewer', 'coordinator'].filter((r) => roles[r]).map((r) => (r === 'reviewer' && roles.merge ? 'reviewer (merges)' : r));
   return ` · roles: developer${on.length ? ', ' + on.join(', ') : ''}`;
 };
 
@@ -426,7 +451,7 @@ async function fleet(o) {
   const coordinatorOn = start.projects.some((p) => p.roles && p.roles.coordinator);
   const state = { pid: process.pid, fleet: fleetId, api: apiBase(), startedAt: new Date().toISOString(), projects: start.projects.map((p) => p.key), whenIdle, coordinatorOn, inbox: null, workers: [] };
   const persist = () =>
-    saveState({ ...state, workers: [...running.values()].map((w) => ({ fire: w.fire.fire, role: roleOf(w.fire), label: w.label, task: w.fire.task, project: w.fire.project, worktree: w.fire.worktree, branch: w.fire.branch ?? null, model: w.fire.model ?? null, effort: w.fire.effort ?? null, fallbackModel: w.fire.fallbackModel ?? null, bgId: w.bgId, since: w.since })) });
+    saveState({ ...state, workers: [...running.values()].map((w) => ({ fire: w.fire.fire, role: roleOf(w.fire), event: w.fire.event ?? null, label: w.label, task: w.fire.task, project: w.fire.project, worktree: w.fire.worktree, branch: w.fire.branch ?? null, model: w.fire.model ?? null, effort: w.fire.effort ?? null, fallbackModel: w.fire.fallbackModel ?? null, bgId: w.bgId, since: w.since })) });
   persist();
 
   let stopping = null; // 'after_current' | 'now'
@@ -439,7 +464,10 @@ async function fleet(o) {
     persist();
     await stopWorker(w.bgId);
     removeRoleWorktree(w.fire);
-    await api('POST', `/fleet/${fleetId}/workers/${w.fire.fire}/end`, { reason }).catch((e) => say(`could not report the end of ${w.fire.task ?? w.fire.fire}: ${e.message}`));
+    const r = await api('POST', `/fleet/${fleetId}/workers/${w.fire.fire}/end`, { reason }).catch((e) => (say(`could not report the end of ${w.fire.task ?? w.fire.fire}: ${e.message}`), null));
+    // SPM-590: what the land worker reported (an older API sends nothing)
+    if (isLand(w.fire) && r && r.land)
+      say(r.land.landed ? `Landed ${prs(r.land.landed)} in push ${String(r.land.commit ?? '').slice(0, 7)}${r.land.left ? ` · ${r.land.left} not merged (on the board)` : ''}` : `Landing ${w.fire.project}: nothing landed${r.land.left ? ` · ${r.land.left} back to the queue or the board` : ''}`);
   };
 
   const finish = async (why) => {
@@ -499,14 +527,14 @@ async function fleet(o) {
         if (isBusy(a)) w.worked = true;
         // state blocked + status idle: the turn ended asking for a person, whom nobody watching a worker is
         if (isDone(a) || (w.worked && !isBusy(a))) {
-          say(roleOf(w.fire) === 'coordinator' ? COORDINATOR_IDLE : `${w.label} finished (${a.status ?? 'done'}); slot free`);
+          say(isLand(w.fire) ? `${w.label} finished` : roleOf(w.fire) === 'coordinator' ? COORDINATOR_IDLE : `${w.label} finished (${a.status ?? 'done'}); slot free`);
           await endWorker(w, 'finished');
         } else if (a.state === 'blocked' && !w.blockedSaid) {
           w.blockedSaid = true;
           say(`${w.label} is blocked: an approval in Needs you, or a prompt only the terminal shows (claude attach ${w.bgId})`);
         }
       } else if (w.seen || Date.now() - Date.parse(w.since) > 120_000) {
-        say(roleOf(w.fire) === 'coordinator' ? `Coordinator's session is gone from claude agents; ${COORDINATOR_IDLE.slice('Coordinator: '.length)}` : `${w.label} is gone from claude agents; slot free`);
+        say(isLand(w.fire) ? `${w.label}: its session is gone from claude agents` : roleOf(w.fire) === 'coordinator' ? `Coordinator's session is gone from claude agents; ${COORDINATOR_IDLE.slice('Coordinator: '.length)}` : `${w.label} is gone from claude agents; slot free`);
         await endWorker(w, 'gone');
       }
     }
@@ -574,7 +602,7 @@ async function fleet(o) {
       startBackoff = 0;
       running.set(r.fire, { fire: r, label, bgId: w.id, since, last: 'started' });
       persist();
-      say(`${roleOf(r) === 'coordinator' ? 'Coordinator woke for its inbox' : `started ${label}`} in worktree ${r.worktree}${modelText(r) ? ` ${modelText(r)}` : ''}${w.id ? ` (claude ${w.id})` : ''}`);
+      say(`${isLand(r) ? `Landing ${prs(landOf(r).length)} of ${r.project} in one push` : roleOf(r) === 'coordinator' ? 'Coordinator woke for its inbox' : `started ${label}`} in worktree ${r.worktree}${modelText(r) ? ` ${modelText(r)}` : ''}${w.id ? ` (claude ${w.id})` : ''}`);
       await api('POST', `/fleet/${fleetId}/workers`, { fire: r.fire, claude_bg_id: w.id }).catch((e) => say(`could not report ${label} started: ${e.message}`));
     } catch (e) {
       startBackoff = Math.min(Math.max(startBackoff * 2, 30_000), 300_000);
@@ -602,12 +630,14 @@ async function status() {
     return `worktree ${w.worktree}${modelText(w) ? `  ${modelText(w)}` : ''}  ${mins} min  ${a ? `${a.status ?? ''}${a.state ? `, ${a.state}` : ''}` : 'not in claude agents'}${w.bgId ? `  (claude attach ${w.bgId})` : ''}`;
   };
   // SPM-503: the Coordinator, and its inbox as the last wait from the board counted it
-  const coord = s.workers.find((w) => w.role === 'coordinator');
+  const coord = s.workers.find((w) => w.role === 'coordinator' && w.event !== 'land');
+  const lander = s.workers.find((w) => w.event === 'land');
   const inbox = typeof s.inbox === 'number' ? `${s.inbox} open item${s.inbox === 1 ? '' : 's'} in its inbox at the last check` : 'inbox count not known yet';
   // SPM-587: the Coordinator stays on duty for the whole run; its Claude session runs only while its inbox has items
   if (coord) console.log(`Coordinator: on duty, handling its inbox now  ${detail(coord)} · ${inbox}`);
   else if (s.coordinatorOn !== false) console.log(`Coordinator: on duty, idle until the next question, approval or comment · ${inbox}`);
   else console.log('Coordinator: off for these projects (Setup › Fleet › Roles)');
+  if (lander) console.log(`Merge queue: landing now  ${detail(lander)}`);
   const workers = s.workers.filter((w) => w.role !== 'coordinator');
   if (!workers.length) console.log('No worker running: it waits for ready tasks.');
   for (const w of workers) console.log(`  ${w.label ?? `${w.role ?? 'developer'} ${w.task ?? w.project}`}  ${detail(w)}`);
