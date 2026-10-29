@@ -267,7 +267,8 @@ const isBusy = (a) => a.state === 'working' || (a.status && a.status !== 'idle')
 
 /** Starts one fleet session for a fire, with its role's agent; resolves with the id `claude --bg` printed. */
 function startWorker(fire) {
-  const args = ['--bg', '--no-chrome', '--worktree', fire.worktree, '--permission-mode', 'auto'];
+  // SPM-602 (D-094): Claude in Chrome when the project's workers may use the browser; an older API sends no chrome
+  const args = ['--bg', fire.chrome === true ? '--chrome' : '--no-chrome', '--worktree', fire.worktree, '--permission-mode', 'auto'];
   if (fire.model) args.push('--model', fire.model);
   // SPM-508 (D-090): an older API sends neither: no flag, the worker's own default
   if (fire.effort) args.push('--effort', fire.effort);

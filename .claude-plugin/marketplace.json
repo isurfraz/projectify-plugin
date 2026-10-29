@@ -12,7 +12,7 @@
       "name": "projectify",
       "source": "./plugins/projectify",
       "description": "Projectify: the board tools, a SessionStart hook and skills to plan, pick up and hand off work.",
-      "version": "1.6.0"
+      "version": "1.7.0"
     }
   ]
 }
