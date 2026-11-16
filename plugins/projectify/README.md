@@ -23,7 +23,7 @@ For Claude Code on the web and cloud sessions, add Projectify as a connector on 
 
 ## Run the fleet
 
-The fleet is optional and for Claude Code in a terminal. Workers run on your machine, on your Claude plan; Projectify never runs Claude itself, and waiting for work costs no tokens.
+The fleet is optional and for Claude Code in a terminal. Workers run on your machine, on your Claude plan, and waiting for work costs no tokens.
 
 1. **Install or update the plugin** in Claude Code: the two commands above, or `/plugin update projectify@projectify`. You need Node 18 or later and the GitHub CLI (`gh auth login`); workers open their pull requests with it.
 2. **Set up this machine:** run `/projectify:setup` in any repo and say yes to the fleet. It saves this machine's token, runs `projectify setup-machine` (puts `projectify` in `~/.local/bin`, finds your project repos under `~/Documents/GitHub` and `~/code`, records and trusts each one) and ends with `projectify fleet doctor`. Repos somewhere else: `projectify setup-machine ~/src`.
