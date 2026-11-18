@@ -14,5 +14,5 @@ Leave the board so the next session, any person or Claude, can pick up from cold
    - next: what the next session should do first, and anything it must not do.
 3. Learned something durable? Update the Brief or a doc (`get_doc`, then `edit_doc` with base_version) or record a decision (`record_decision`) with the alternatives you considered.
 4. Created or changed an artifact, export or doc outside Projectify? Save it with `save_to_drive` and list it in `changed_sources` (or pass `[]`).
-5. Post one line in the room (`say`, kind done) if others must pick something up.
+5. Post one line in the room, where the project has one (`say`, kind done), if others must pick something up.
 6. Call `end_session({ handoff: { done, unfinished, next, touched }, notes, changed_sources })`. It releases your claims and saves the handoff in one call.

@@ -8,9 +8,9 @@ description: "Define and plan work on a Projectify board before any task exists:
 Define before you create: no task exists until the gates for its size are passed. Open a session first (start_session) if you have none.
 
 1. Read the project's own Define stages with `get_workflow({ project, moment: "defining" })`. They are this workspace's version and win over the outline below.
-2. Read what exists so nothing is duplicated: the Brief, Knowledge, Decisions, `search` and `list_tasks`, and the code the work touches.
+2. Read what exists so nothing is duplicated: the Brief, the project's docs and Decisions (`list_docs`), `search` and `list_tasks`, and the code the work touches.
 3. Walk the stages in order. Ask at each gate with your multiple-choice tool (AskUserQuestion in Claude Code; `ask_question` when the person is not in this chat), the option you recommend first. Put the gate's detail in your chat message first as a short list, one item per line, and keep the widget's question to one short sentence. Record their words as the approval (`update_task` approve, or on `create_task`).
-4. Size decides how far you go: **S** (a fix or tweak under one session) is one task after Gate A. **M** is one epic of several tasks. **L** adds a spec and a plan as Knowledge notes (`create_doc`).
+4. Size decides how far you go: **S** (a fix or tweak under one session) is one task after Gate A. **M** is one epic of several tasks. **L** adds a spec and a plan as docs (`create_doc`).
 5. Create the work only at the Board stage. Every task carries a **summary** (one plain sentence a newcomer understands, no refs or code), ## Why, ## What, ## Done when (checkable items) and ## Not doing unless asked. Set `needs_from_you` when it needs a person.
 6. Tell the person what ranks above the new work or blocks it, and wait for their go before anyone claims it.
 
