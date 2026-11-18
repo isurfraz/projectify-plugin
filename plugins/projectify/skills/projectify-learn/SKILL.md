@@ -1,0 +1,33 @@
+---
+name: projectify-learn
+description: "Learn from a video, link, document or pictures and put it in Projectify: explain it to the person, and turn it into a team workflow (steps, prompts, checks) and techniques. Use when the person says \"explain this\", \"turn this into a workflow\", \"learn from\", \"make a workflow from\" or \"what does this video teach\", with a file on this computer or a link; also to run a team workflow (\"make me a cinematic ad\") or change one (\"make every check Claude-only\")."
+---
+
+# Learn into Projectify
+
+The person wants something explained, or turned into a workflow their team and Claude can run again and again. You read it here, on their computer, more thoroughly than a server can: the speech, every scene, the text on screen. Projectify shows the explainer filling in as you go.
+
+## Start
+1. Call `learn` with the source ({kind, name, path or url}) and the goal (explain, or workflow when they said so). If they gave you an explainer ref (EX-4) from Projectify, fill that one in instead: `get_explainer` and carry on from its stages.
+2. The answer has the upload command and the shapes to write. Keep it open.
+
+## Read it
+1. Read it where it is. A video or a link on this computer: run the Projectify reader (`python3 analyse_media.py <file or link> --out <folder>`; get it with `curl -fsSL <api>/v1/public/learn/analyse_media.py -o analyse_media.py` if the projectify-learn skill did not bring it). It writes a manifest, the transcript, scene frames, contact sheets with times, and text read off each frame, and names any tool that is missing with its install line.
+2. Look properly: open every contact sheet, then the frames that show settings, menus, prompts or results. Line the frames up with the transcript by time. Note what is said and what is only on screen.
+3. Write down the process (what always happens, in order) apart from the techniques (tricks that apply only in some cases, each with when to use it).
+4. Upload only the frames you will use (about 640 px wide JPEGs) with the upload command, and refer to them by frame id.
+
+The reader is bundled with this skill: `python3 "${CLAUDE_PLUGIN_ROOT}/skills/projectify-learn/analyse_media.py" <file or link> --out <folder>`. Without the plugin, download it: `curl -fsSL https://api.projectify.si/v1/public/learn/analyse_media.py -o analyse_media.py`. It needs python3 and ffmpeg; whisper.cpp (or mlx-whisper, openai-whisper, faster-whisper, or OPENAI_API_KEY), yt-dlp and tesseract make it better, and it says how to add each one missing. Tell the person what is missing in one line and carry on with what there is.
+
+## Write it
+- **digest** (update_explainer digest): title, kind (how_to | concept | story | reference | mixed), tldr (two sentences), audience, minutes {source, read}, ideas [{title, body, at}], steps [{title, body, app, settings [{name, value}], at, to, frames ["f12"]}], tools [{name, what, cost}], terms [{term, means}], tips [{text, kind tip|trap, at}], numbers [{label, value, at}], techniques [{name, summary, useWhen [..], avoidWhen, steps, snippet, settings, worksWith, tags, examples, source {at, to}}], unclear [..]. `at` is seconds into the video.
+- **explanation** (update_explainer explanation): plan (what they will learn, in order) and blocks, each {type, title, ...}: tldr {text} · text {body} · diagram {style flow|cycle|tree|compare, nodes [{id, label, note}], edges [{from, to, label}], caption} · cards {cards [{title, body, at}]} · steps {steps [{title, body, at, frames}]} · table {columns, rows, note} · techniques {names} · tips {tips [{text, kind, at}]} · picture {frame | file | url, caption, prompt} · quote {text, who, at} · glossary {terms} · quiz {questions [{q, options, answer, why}]}. Lead with the tldr and a diagram of the whole process; give the steps their frames; show the techniques apart; end with three quiz questions.
+- **workflow** (save_workflow): title, summary, useWhen (what a person would say), graph {nodes, edges}. Node kinds: phase (a stage that groups steps, like "assets" or "scenes"); input (something the person brings: a photo, a brief, a logo, a choice); step (something to do by hand); prompt (a prompt to give an ai, with blanks to fill); tool (an action in an app or website, with its settings); decision (a choice that sends the work down different branches); check (a gate the run stops at: you, claude, both or either must pass it); output (what the workflow produces); note (advice that applies across steps); flow (runs another workflow). A node: id, kind, title, summary, body, phase (a phase node's id), actor person|agent|either, app, url, settings [{name, value, why}], prompt {text with {{blanks}}, model, fills [{key, label, example}]}, fields (on an input: [{key, label, type text|long_text|image|file|link|choice|number, required, options, hint}]), produces, techniques [{technique (its name), use always|auto|never, note}], tips, traps, cost, time, connector {server, tool, args} (an MCP tool that can do a tool step), source {at, to, quote}, media [{frame}]. A phase may repeat: repeat {over: an input key with one item per line, as: the blank each item fills, label}. Edges: {from, to, label, kind next|yes|no|retry}.
+- **checks**: a check node has gate {who person|agent|both|either, mode pass|pick, shows, showsNode, criteria [{text, must}], failIf, methods (ways Claude may check: Open the file itself, Look at frames across the whole clip, Watch or listen to all of it, Compare with the reference inputs…), banned (Judge from the prompt alone, Trust the app’s own preview…), steps, onFail retry|ask|stop, backTo (a node id), tries}. Put a check wherever the source stops to look at a result (a person watching a draft is who: person). Use pick where someone chooses from several (faces, takes). Every retry needs a backTo or a retry arrow.
+
+Set each stage as you go (`update_explainer` stage {key, state, detail}): read, understand, explain, workflow. A failure is a stage set to failed with the reason in one line and the fixes that fit; then tell the person and stop guessing.
+
+## Run and change workflows
+- "Make me a cinematic ad": `list_workflows` with q (through `act`), then `run_workflow`. Projectify drives the run: do what each answer says, report with `update_run`, and carry on with other runs while a check waits on the person in Approvals.
+- "Make a copy where every check is Claude-only": `get_flow` (raw: true), change the graph as asked, then `duplicate_workflow` with the new graph and a note (through `act`). "Remove the steps between X and Y" on the workflow itself: `save_workflow` with workflow, base_version and a note.
+- Only a person marks a workflow ready, and only a person (or you, quoting their answer) answers a check.
