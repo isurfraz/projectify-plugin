@@ -3,7 +3,8 @@
 //
 //   projectify fleet [KEYS…] [--workers N] [--watch | --until-empty] [--dry-run]
 //   projectify fleet doctor
-//   projectify fleet status
+//   projectify fleet status            (also lists the resources: holders and queue)
+//   projectify fleet scan              (what the heartbeat would report: apps, simulators, Xcode, load)
 //   projectify fleet stop [--now]
 //   projectify setup-machine [FOLDERS…] [--dry-run]
 //
@@ -68,7 +69,7 @@ const WORKER_ENV = { ENABLE_CLAUDEAI_MCP_SERVERS: 'false' };
 const quota = () => readJson(path.join(DATA_DIR, 'quota.json'));
 
 // SPM-503 (Fleet 3): each fire has a role. An older API sends none: a planning step is the planner, the rest developers.
-const ROLES = ['planner', 'developer', 'reviewer', 'coordinator'];
+const ROLES = ['planner', 'developer', 'reviewer', 'coordinator', 'qa'];
 const roleOf = (fire) => (ROLES.includes(fire?.role) ? fire.role : fire?.step === 'planning' ? 'planner' : 'developer');
 /** The plugin agent each role starts with; PROJECTIFY_<WORKER|REVIEWER|COORDINATOR>_AGENT overrides it (plugin development). */
 const ROLE_AGENTS = {
@@ -76,9 +77,10 @@ const ROLE_AGENTS = {
   developer: () => process.env.PROJECTIFY_WORKER_AGENT || 'projectify:projectify-worker',
   reviewer: () => process.env.PROJECTIFY_REVIEWER_AGENT || 'projectify:projectify-reviewer',
   coordinator: () => process.env.PROJECTIFY_COORDINATOR_AGENT || 'projectify:projectify-coordinator',
+  qa: () => process.env.PROJECTIFY_QA_AGENT || 'projectify:projectify-qa',
 };
-/** Reviewer and Coordinator read and comment; they never change files. */
-const READ_ONLY_ROLES = new Set(['reviewer', 'coordinator']);
+/** Reviewer, Coordinator and QA read, play and comment; they never change files. */
+const READ_ONLY_ROLES = new Set(['reviewer', 'coordinator', 'qa']);
 const READ_ONLY_DISALLOWED = 'Edit,Write,NotebookEdit';
 /** SPM-590: a land fire: the Coordinator agent landing the merge queue in one push to main. */
 const isLand = (fire) => fire?.event === 'land';
@@ -370,13 +372,15 @@ const COORDINATOR_IDLE = 'Coordinator: inbox handled; still on duty, it wakes on
 /** " · roles: developer, reviewer, coordinator" when the API sends a project's roles (SPM-503), else nothing. */
 const rolesText = (roles) => {
   if (!roles || typeof roles !== 'object') return '';
-  const on = ['reviewer', 'coordinator'].filter((r) => roles[r]).map((r) => (r === 'reviewer' && roles.merge ? 'reviewer (merges)' : r));
+  const on = ['reviewer', 'coordinator', 'qa'].filter((r) => roles[r]).map((r) => (r === 'reviewer' && roles.merge ? 'reviewer (merges)' : r));
   return ` · roles: developer${on.length ? ', ' + on.join(', ') : ''}`;
 };
 
-function printProjects(projects, skipped) {
+function printProjects(projects, skipped, missed = []) {
   for (const p of projects) say(`working ${p.key} · ${p.name} · ${untilde(p.repoPath)}${rolesText(p.roles)}`);
   for (const s of skipped) say(`skipping ${s.key}${s.name ? ` · ${s.name}` : ''}: ${s.why}`);
+  // SPM-964: a fleet started with keys works only those, and never sees projects turned on later
+  if (missed.length) say(`will miss ${missed.map((p) => p.key).join(', ')} (fleet on, not in this list; start without project keys to work every fleet-on project)`);
 }
 
 /** --dry-run: what a fleet would take, in order, without starting one. */
@@ -436,13 +440,14 @@ async function fleet(o) {
   const start = await api('POST', '/fleet/start', { projects: o.keys.length ? o.keys : null, workers: o.workers, untilEmpty: o.untilEmpty, ...(whenIdleFlag ? { whenIdle: whenIdleFlag } : {}), plugin_version: pluginVersion() });
   // an older API sends no whenIdle: --until-empty stops, anything else watches
   const whenIdle = start.whenIdle === 'stop' || start.whenIdle === 'watch' ? start.whenIdle : start.fleet?.untilEmpty || o.untilEmpty ? 'stop' : 'watch';
-  printProjects(start.projects, start.skipped);
+  printProjects(start.projects, start.skipped, start.missed ?? []);
   if (!start.fleet) die('no project to work: every one was skipped (above).');
   const claudeJson = readJson(CLAUDE_JSON);
   for (const p of start.projects)
     if (!fs.existsSync(p.repoPath)) say(`warning: ${p.key}'s repo ${untilde(p.repoPath)} is missing; its tasks cannot start (projectify fleet doctor)`);
     else if (claudeJson && !trusted(p.repoPath, claudeJson)) say(`warning: Claude Code does not trust ${untilde(p.repoPath)}, so ${p.key}'s workers cannot start (projectify setup-machine)`);
-  const fleetId = start.fleet.id;
+  let fleetId = start.fleet.id;
+  let maxWorkers = start.fleet.maxWorkers;
   say(`fleet ${fleetId.slice(-6)} on ${start.machine.label}: up to ${start.fleet.maxWorkers} worker${start.fleet.maxWorkers === 1 ? '' : 's'}. Ctrl-C: stop after current; twice: stop now.`);
   say(whenIdle === 'stop' ? 'When idle: stop (once nothing is ready, running, queued or waiting for the Coordinator)' : 'When idle: keep watching (no Claude session runs until something happens)');
 
@@ -465,11 +470,40 @@ async function fleet(o) {
     persist();
     await stopWorker(w.bgId);
     removeRoleWorktree(w.fire);
-    const r = await api('POST', `/fleet/${fleetId}/workers/${w.fire.fire}/end`, { reason }).catch((e) => (say(`could not report the end of ${w.fire.task ?? w.fire.fire}: ${e.message}`), null));
+    const r = await api('POST', `/fleet/${w.fleetId ?? fleetId}/workers/${w.fire.fire}/end`, { reason }).catch((e) => (say(`could not report the end of ${w.fire.task ?? w.fire.fire}: ${e.message}`), null));
     // SPM-590: what the land worker reported (an older API sends nothing)
     if (isLand(w.fire) && r && r.land)
       say(r.land.landed ? `Landed ${prs(r.land.landed)} in push ${String(r.land.commit ?? '').slice(0, 7)}${r.land.left ? ` · ${r.land.left} not merged (on the board)` : ''}` : `Landing ${w.fire.project}: nothing landed${r.land.left ? ` · ${r.land.left} back to the queue or the board` : ''}`);
   };
+
+  // SPM-971: the API stops a fleet whose launcher sent no heartbeat for 10 minutes (a network drop). That is not a stop
+  // anyone asked for: this launcher is still here, so it starts a new run once the API answers and carries on.
+  const silentStop = (why) => !stopping && /sent no heartbeat/.test(why ?? '');
+  let reviving = null;
+  const revive = (why) =>
+    (reviving ??= (async () => {
+      say(`the board stopped this run (${why}); starting a new one when it answers`);
+      let wait = 1000;
+      while (!finished && !stopping) {
+        try {
+          const again = await api('POST', '/fleet/start', { projects: o.keys.length ? o.keys : null, workers: o.workers, untilEmpty: o.untilEmpty, ...(whenIdleFlag ? { whenIdle: whenIdleFlag } : {}), plugin_version: pluginVersion() });
+          if (!again.fleet) throw new Error('no project to work');
+          fleetId = again.fleet.id;
+          maxWorkers = again.fleet.maxWorkers;
+          state.fleet = fleetId;
+          persist();
+          say(`fleet ${fleetId.slice(-6)} started again: carrying on`);
+          return;
+        } catch (e) {
+          if (e.status === 401 || e.status === 403) die(e.message);
+          say(`${e.message}; trying again in ${Math.round(wait / 1000)} s`);
+          await sleep(wait);
+          wait = Math.min(wait * 2, 60_000);
+        }
+      }
+    })().finally(() => {
+      reviving = null;
+    }));
 
   const finish = async (why) => {
     if (finished) return;
@@ -497,12 +531,49 @@ async function fleet(o) {
   process.on('SIGTERM', () => process.emit('SIGINT'));
 
   // heartbeat: what runs, every 30 s; it also carries a stop from the web app
+  const pendingEvents = []; // lease events (SPM-967) the next heartbeat reports
+  let rescanning = false;
   const heartbeat = async () => {
+    // SPM-962: the apps, simulators and load of this machine; a failed scan must never cost the heartbeat
+    let found = { tools: undefined, machine: undefined };
+    try {
+      found = scanMachine(start.projects.filter((p) => p.repoPath), running.size);
+    } catch (e) {
+      log(`resource scan failed: ${e.message}`);
+    }
+    // one event per lease and kind (the newest wins), at most the 64 the board accepts; the rest wait for the next heartbeat
+    const byKey = new Map(pendingEvents.map((e) => [`${e.lease}:${e.event}`, e]));
+    pendingEvents.length = 0;
+    const all = [...byKey.values()];
+    const leaseEvents = all.slice(0, 64);
+    pendingEvents.push(...all.slice(64));
     const r = await api('POST', `/fleet/${fleetId}/heartbeat`, {
+      ...(leaseEvents.length ? { lease_events: leaseEvents } : {}),
       running: [...running.values()].map((w) => ({ fire: w.fire.fire, worker: w.bgId, task: w.fire.task, since: w.since, last: w.last ?? null })),
       quota: quota(),
-    }).catch((e) => (say(`heartbeat failed: ${e.message}`), null));
-    if (r?.stopped) {
+      ...(found.tools ? { tools: found.tools, machine: found.machine } : {}),
+    }).catch((e) => (say(`heartbeat failed: ${e.message}`), pendingEvents.unshift(...leaseEvents), null));
+    // SPM-967: what the board asks of this machine's leases (switch a folder, collect, restore, boot a simulator)
+    // SPM-996: fires whose Projectify session ended; watch() stops their process if it lingers a minute
+    if (Array.isArray(r?.done)) {
+      const now = Date.now();
+      for (const w of running.values()) {
+        if (r.done.includes(w.fire.fire)) w.doneSince ??= now;
+        else delete w.doneSince;
+      }
+    }
+    if (r?.toolWork) pendingEvents.push(...applyToolWork(r.toolWork));
+    // SPM-957: Fleet setup's Rescan: scan and report again now, not at the next beat
+    if (r?.rescan && !rescanning) {
+      rescanning = true;
+      setTimeout(() => {
+        rescanning = false;
+        heartbeat().catch((e) => log(`rescan heartbeat failed: ${e.message}`));
+      }, 100);
+    }
+    if (r?.stopped && silentStop(r.reason)) {
+      await revive(r.reason);
+    } else if (r?.stopped) {
       stopping = 'now';
       await finish(r.reason ?? 'stopped from the board');
     } else if (r?.stopRequested && !stopping) {
@@ -514,6 +585,7 @@ async function fleet(o) {
   };
   const hb = setInterval(heartbeat, HEARTBEAT_MS);
   hb.unref();
+  heartbeat().catch((e) => log(`first heartbeat failed: ${e.message}`)); // the machine's resources show at once, not after 30 s
 
   // watcher: a finished worker frees its slot
   const watch = async () => {
@@ -530,6 +602,11 @@ async function fleet(o) {
         if (isDone(a) || (w.worked && !isBusy(a))) {
           say(isLand(w.fire) ? `${w.label} finished` : roleOf(w.fire) === 'coordinator' ? COORDINATOR_IDLE : `${w.label} finished (${a.status ?? 'done'}); slot free`);
           await endWorker(w, 'finished');
+        } else if (w.doneSince && Date.now() - w.doneSince > 60_000 && (a.state === 'blocked' || !isBusy(a))) {
+          // SPM-996: its session ended and the process still waits (blocked or idle): its work is done
+          say(`${w.label} ended its session; slot free`);
+          log(`stopped ${w.bgId}: its work was done`);
+          await endWorker(w, 'its work was done');
         } else if (a.state === 'blocked' && !w.blockedSaid) {
           w.blockedSaid = true;
           say(`${w.label} is blocked: an approval in Needs you, or a prompt only the terminal shows (claude attach ${w.bgId})`);
@@ -552,6 +629,11 @@ async function fleet(o) {
       await sleep(1000);
       continue;
     }
+    // SPM-971: workers of an earlier run still count against this machine, and a new run's /next does not see them
+    if (running.size >= maxWorkers) {
+      await sleep(1000);
+      continue;
+    }
     let r;
     try {
       r = await api('GET', `/fleet/${fleetId}/next?wait=${NEXT_WAIT_S}`, null, { signal: ac.signal, timeoutMs: (NEXT_WAIT_S + 20) * 1000 });
@@ -563,6 +645,10 @@ async function fleet(o) {
       say(`${e.message}; trying again in ${Math.round(backoff / 1000)} s`);
       await sleep(backoff);
       backoff = Math.min(backoff * 2, 60_000);
+      continue;
+    }
+    if (r.kind === 'stop' && silentStop(r.reason)) {
+      await revive(r.reason);
       continue;
     }
     if (r.kind === 'stop') {
@@ -577,7 +663,13 @@ async function fleet(o) {
         state.inbox = inbox;
         persist();
       }
-      const line = `waiting: ${r.why} (${r.running} running${inbox ? `, ${inbox} for the Coordinator` : ''})`;
+      // SPM-980: work carried over from a run that stopped, so a stall is visible
+      const carried = Array.isArray(r.carried) ? r.carried : [];
+      if (JSON.stringify(carried) !== JSON.stringify(state.carried ?? [])) {
+        state.carried = carried;
+        persist();
+      }
+      const line = `waiting: ${r.why} (${r.running} running${inbox ? `, ${inbox} for the Coordinator` : ''}${carried.length ? `, ${carriedText(carried)}` : ''})`;
       if (line !== lastWait) say(line);
       lastWait = line;
       // the server stops an idle 'stop' fleet itself (kind stop); this covers an older API that does not
@@ -601,7 +693,7 @@ async function fleet(o) {
     try {
       const w = await startWorker(r);
       startBackoff = 0;
-      running.set(r.fire, { fire: r, label, bgId: w.id, since, last: 'started' });
+      running.set(r.fire, { fire: r, label, bgId: w.id, since, last: 'started', fleetId });
       persist();
       say(`${isLand(r) ? `Landing ${prs(landOf(r).length)} of ${r.project} in one push` : roleOf(r) === 'coordinator' ? 'Coordinator woke for its inbox' : `started ${label}`} in worktree ${r.worktree}${modelText(r) ? ` ${modelText(r)}` : ''}${w.id ? ` (claude ${w.id})` : ''}`);
       await api('POST', `/fleet/${fleetId}/workers`, { fire: r.fire, claude_bg_id: w.id }).catch((e) => say(`could not report ${label} started: ${e.message}`));
@@ -614,13 +706,537 @@ async function fleet(o) {
   }
 }
 
+// ---------------------------------------------------------------------------------------------
+// lease work: switch a project folder to the lease holder's commit, hand out simulators (SPM-967, D-137 §5)
+// ---------------------------------------------------------------------------------------------
+// The heartbeat answers with `toolWork`: what each granted or released lease needs on this machine. Every step is
+// safe to repeat (the next heartbeat asks again until the event it reports is recorded). Nothing is ever stashed or
+// discarded: a dirty folder is a "failed" event (the resource shows needs a person), uncollected work is committed.
+
+const LEASE_STATE_FILE = path.join(DATA_DIR, 'leases.json');
+const git = (dir, args, opts = {}) => run('git', ['-C', dir, ...args], { timeout: 60_000, ...opts });
+
+/** Where a lease's switch is remembered on this machine: lease id → { folder, prevRef }. A crash must not lose the way back. */
+const leaseMemory = () => readJson(LEASE_STATE_FILE) ?? { folders: {}, sims: {} };
+function saveLeaseMemory(m) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(LEASE_STATE_FILE, JSON.stringify(m, null, 1));
+  } catch (e) {
+    log(`could not save lease state: ${e.message}`);
+  }
+}
+
+/** The folder is clean when nothing tracked is modified and nothing is untracked except Unity's *.meta (which collect). */
+function folderDirt(dir) {
+  const r = git(dir, ['status', '--porcelain=v1', '-uall']);
+  if (!r.ok) return `git status failed in ${untilde(dir)}: ${r.err || r.out}`;
+  const lines = r.out.split('\n').filter(Boolean);
+  const bad = lines.filter((l) => !(l.startsWith('?? ') && l.endsWith('.meta')));
+  return bad.length ? `${untilde(dir)} has ${bad.length} uncommitted change${bad.length === 1 ? '' : 's'} (${bad.slice(0, 3).map((l) => l.trim()).join(', ')}${bad.length > 3 ? ', …' : ''})` : null;
+}
+
+/** The ref to come back to: the branch name, else the commit the folder stood on. */
+function currentRef(dir) {
+  const b = git(dir, ['symbolic-ref', '-q', '--short', 'HEAD']);
+  if (b.ok && b.out) return b.out;
+  const h = git(dir, ['rev-parse', 'HEAD']);
+  return h.ok ? h.out : null;
+}
+
+/** Whether the folder has anything the app wrote (tracked changes or new files, .meta included). */
+const hasChanges = (dir) => git(dir, ['status', '--porcelain=v1', '-uall']).out.length > 0;
+
+/**
+ * Commits what the app wrote on the detached HEAD. Returns the commit (HEAD when nothing was written).
+ * With `keep`, a fleet-tool/<key>/<time> branch points at it so no work depends on the reflog.
+ */
+function collectFolder(dir, tool, lease, keep) {
+  let made = false;
+  if (hasChanges(dir)) {
+    git(dir, ['add', '-A']);
+    const c = git(dir, ['-c', 'user.name=Projectify fleet', '-c', 'user.email=fleet@projectify.si', 'commit', '--no-verify', '-m', `${tool}: what the app wrote under lease ${lease.slice(0, 8)}`]);
+    if (!c.ok) return { error: `could not commit what ${tool} wrote: ${c.err || c.out}` };
+    made = true;
+  }
+  const h = git(dir, ['rev-parse', 'HEAD']);
+  if (!h.ok) return { error: `rev-parse failed: ${h.err}` };
+  let branch = null;
+  if (keep && made) {
+    branch = `fleet-tool/${tool}/${new Date().toISOString().replace(/[-:]/g, '').replace(/\..*/, '')}`;
+    git(dir, ['branch', branch, h.out]);
+  }
+  return { commit: h.out, made, branch };
+}
+
+/** A lease's branch and commit come from another session: never let one be read as a git option or anything but a name or a sha. */
+const SAFE_SHA = /^[0-9a-f]{7,40}$/;
+function safeBranch(dir, b) {
+  return typeof b === 'string' && b.length > 0 && b.length <= 200 && !b.startsWith('-') && git(dir, ['check-ref-format', '--branch', b]).ok;
+}
+
+/** The commit a lease's folder should stand on: the holder's commit, else the head of its branch on origin. Null (with why) when neither resolves. */
+function leaseCommit(dir, commit, branch) {
+  if (commit != null && !SAFE_SHA.test(commit)) return { error: `the lease's commit "${String(commit).slice(0, 20)}" is not a commit id` };
+  if (commit && git(dir, ['cat-file', '-e', `${commit}^{commit}`]).ok) return { commit: git(dir, ['rev-parse', '--verify', `${commit}^{commit}`]).out };
+  if (!branch) return commit ? { error: `commit ${commit.slice(0, 8)} is not in ${untilde(dir)} and the lease names no branch to fetch it from` } : { commit: null };
+  if (!safeBranch(dir, branch)) return { error: `the lease's branch "${String(branch).slice(0, 40)}" is not a safe branch name` };
+  const f = git(dir, ['fetch', '--quiet', 'origin', '--', branch], { timeout: 120_000 });
+  if (commit) {
+    const have = git(dir, ['cat-file', '-e', `${commit}^{commit}`]).ok;
+    return have ? { commit: git(dir, ['rev-parse', '--verify', `${commit}^{commit}`]).out } : { error: `commit ${commit.slice(0, 8)} is not on origin/${branch}: push it first` };
+  }
+  if (!f.ok) return { commit: null }; // the branch is not on origin (yet): the folder stays as it is until the holder gives a commit
+  const h = git(dir, ['rev-parse', '--verify', 'FETCH_HEAD^{commit}']);
+  return h.ok ? { commit: h.out } : { commit: null };
+}
+
+/** Checks out a commit detached (the commit was resolved by leaseCommit). */
+function checkoutDetached(dir, commit) {
+  const r = git(dir, ['checkout', '--quiet', '--detach', commit]);
+  return r.ok ? null : `could not check out ${commit.slice(0, 8)}: ${r.err || r.out}`;
+}
+
+/** Goes back to the recorded ref: a branch by name, a commit detached. */
+function restoreRef(dir, ref) {
+  if (typeof ref !== 'string' || !ref || ref.startsWith('-')) return `the recorded ref "${String(ref).slice(0, 40)}" is not a branch or commit`;
+  const isBranch = git(dir, ['show-ref', '--verify', '--quiet', `refs/heads/${ref}`]).ok;
+  if (!isBranch && !SAFE_SHA.test(ref)) return `the recorded ref "${ref.slice(0, 40)}" is not a branch or commit`;
+  const r = git(dir, isBranch ? ['checkout', '--quiet', ref, '--'] : ['checkout', '--quiet', '--detach', ref]);
+  return r.ok ? null : `could not go back to ${ref}: ${r.err || r.out}`;
+}
+
+/** One folder step of a lease. Returns the lease event to report, or null when there is nothing to say yet. */
+function folderStep(w, mem) {
+  const dir = w.folder;
+  if (!dir || !isDir(dir) || !git(dir, ['rev-parse', '--git-dir']).ok) {
+    if (w.action === 'restore') return { lease: w.lease, event: 'released', ref: null, commit: null }; // nothing to put back: the folder is gone, so the resource must not wait for it forever
+    return w.action === 'switch' ? { lease: w.lease, event: 'failed', detail: `${dir ? untilde(dir) : 'the project folder'} is not a git folder` } : null;
+  }
+  const keep = mem.folders[w.lease];
+  if (w.action === 'switch') {
+    if (keep) return { lease: w.lease, event: 'granted', ref: keep.prevRef, commit: w.commit ?? null }; // switched already; the board missed the event
+    const target = leaseCommit(dir, w.commit, w.branch);
+    if (target.error) return { lease: w.lease, event: 'failed', detail: target.error };
+    if (!target.commit) return null; // the holder has no commit or pushed branch yet: the folder stays as it is until it does
+    const dirt = folderDirt(dir);
+    if (dirt) return { lease: w.lease, event: 'failed', detail: dirt };
+    const prev = currentRef(dir);
+    if (!prev) return { lease: w.lease, event: 'failed', detail: `cannot tell what ${untilde(dir)} stands on` };
+    mem.folders[w.lease] = { folder: dir, prevRef: prev, tool: w.tool, at: new Date().toISOString() };
+    saveLeaseMemory(mem); // recorded before the checkout: a crash in between still knows the way back
+    const bad = checkoutDetached(dir, target.commit);
+    if (bad) {
+      delete mem.folders[w.lease];
+      saveLeaseMemory(mem);
+      return { lease: w.lease, event: 'failed', detail: bad };
+    }
+    return { lease: w.lease, event: 'granted', ref: prev, commit: target.commit };
+  }
+  if (w.action === 'collect') {
+    const c = collectFolder(dir, w.tool, w.lease, true);
+    return c.error ? { lease: w.lease, event: 'failed', detail: c.error } : { lease: w.lease, event: 'collected', commit: c.commit };
+  }
+  if (w.action === 'refresh') {
+    const target = leaseCommit(dir, w.commit, w.branch);
+    if (target.error) return { lease: w.lease, event: 'failed', detail: target.error };
+    if (!target.commit) return null;
+    // what the app wrote since the last collect is committed first, and kept on a branch: a refresh never drops it
+    const c = collectFolder(dir, w.tool, w.lease, true);
+    if (c.error) return { lease: w.lease, event: 'failed', detail: c.error };
+    const bad = checkoutDetached(dir, target.commit);
+    return bad ? { lease: w.lease, event: 'failed', detail: bad } : { lease: w.lease, event: 'refreshed', commit: target.commit };
+  }
+  if (w.action === 'restore') {
+    const ref = keep?.prevRef ?? w.prevRef;
+    if (!ref) return null;
+    // release collects first; whatever the app wrote is kept on a fleet-tool/<key>/<time> branch so the holder can merge it, and the commit goes to the board
+    const c = collectFolder(dir, w.tool, w.lease, true);
+    if (c.error) return { lease: w.lease, event: 'failed', detail: c.error };
+    const bad = restoreRef(dir, ref);
+    if (bad) return { lease: w.lease, event: 'failed', detail: bad };
+    delete mem.folders[w.lease];
+    saveLeaseMemory(mem);
+    return { lease: w.lease, event: 'released', ref: c.branch ?? ref, commit: c.made ? c.commit : null };
+  }
+  return null;
+}
+
+/** Opens the Unity editor on a folder when it is not open (PROJECTIFY_AUTO_OPEN=1: the person chose it for this machine). */
+function autoOpenUnity(folder) {
+  if (process.env.PROJECTIFY_AUTO_OPEN !== '1' || process.platform !== 'darwin') return;
+  if (processes().some((p) => APPS[0].proc.test(p.cmd) && !/Helper|Unity Hub/.test(p.cmd.split(' -')[0]))) return;
+  const root = '/Applications/Unity/Hub/Editor';
+  const v = fs.existsSync(root) ? fs.readdirSync(root).sort().pop() : null;
+  const app = v ? path.join(root, v, 'Unity.app') : '/Applications/Unity.app';
+  if (exists(app)) spawn('open', ['-na', app, '--args', '-projectPath', folder], { detached: true, stdio: 'ignore' }).unref();
+}
+
+/** A simulator for a lease: booted when the lease starts, shut down and erased when it ends (a second holder never sees the first's data). */
+function simStep(w, mem) {
+  const udid = w.instance?.udid;
+  if (!udid) return;
+  if (mem.sims[w.lease]) {
+    mem.sims[w.lease].keep = !!w.keepState;
+    return;
+  }
+  const r = run('xcrun', ['simctl', 'boot', udid], { timeout: 60_000 });
+  // "Unable to boot device in current state: Booted" is already what we want
+  if (!r.ok && !/current state: Booted/.test(r.err)) {
+    log(`simctl boot ${udid} failed: ${r.err}`);
+    return;
+  }
+  mem.sims[w.lease] = { udid, name: w.instance.name, keep: !!w.keepState, at: new Date().toISOString() };
+  saveLeaseMemory(mem);
+}
+
+/** Simulators whose lease is not granted any more: shut down and erased. */
+function simCleanup(work, mem) {
+  const live = new Set(work.filter((w) => w.action === 'boot').map((w) => w.lease));
+  for (const [lease, s] of Object.entries(mem.sims)) {
+    if (live.has(lease)) continue;
+    run('xcrun', ['simctl', 'shutdown', s.udid], { timeout: 60_000 });
+    if (s.keep) {
+      // the task asked to keep its state: shut down, not erased
+      delete mem.sims[lease];
+      saveLeaseMemory(mem);
+      continue;
+    }
+    const e = run('xcrun', ['simctl', 'erase', s.udid], { timeout: 120_000 });
+    if (!e.ok) {
+      log(`simctl erase ${s.udid} failed: ${e.err}`);
+      continue; // tried again on the next heartbeat
+    }
+    delete mem.sims[lease];
+    saveLeaseMemory(mem);
+  }
+}
+
+/** Acts on the heartbeat's lease work; returns the events the next heartbeat reports. Never throws: a failure is logged and retried. */
+function applyToolWork(work) {
+  const events = [];
+  if (!Array.isArray(work)) return events;
+  const mem = leaseMemory();
+  mem.folders ??= {};
+  mem.sims ??= {};
+  // every restore runs before any switch or refresh: a new holder must not switch a folder its predecessor has not been put back yet
+  const order = (w) => (w.action === 'restore' ? 0 : 1);
+  for (const w of [...work].sort((a, b) => order(a) - order(b))) {
+    try {
+      if (w.action === 'boot') simStep(w, mem);
+      else {
+        const e = folderStep(w, mem);
+        if (e) {
+          events.push(e);
+          if (e.event === 'granted' && w.action === 'switch') autoOpenUnity(w.folder);
+          if (e.event === 'failed') say(`${w.tool} on ${w.project ?? 'the project'}: ${e.detail}`);
+        }
+      }
+    } catch (e) {
+      log(`lease work ${w.action} ${w.lease} failed: ${e.message}`);
+    }
+  }
+  try {
+    simCleanup(work, mem);
+  } catch (e) {
+    log(`simulator cleanup failed: ${e.message}`);
+  }
+  return events;
+}
+
+// ---------------------------------------------------------------------------------------------
+// resources: what this machine has, and how loaded it is (SPM-962, D-137, D-138)
+// ---------------------------------------------------------------------------------------------
+
+/** Apps the launcher looks for: how a process shows, where it installs (macOS), and its weight on the machine's budget. */
+const APPS = [
+  { key: 'unity-editor', label: 'Unity editor', kind: 'app', weight: 2, proc: /(?:Unity\.app\/Contents\/MacOS\/Unity|\/Editor\/Unity)(?:\s|$)/, installed: ['/Applications/Unity/Hub/Editor', '/Applications/Unity.app'] },
+  { key: 'blender', label: 'Blender', kind: 'app', weight: 2, proc: /(?:Blender\.app\/Contents\/MacOS\/Blender|\/blender)(?:\s|$)/i, installed: ['/Applications/Blender.app'] },
+  { key: 'godot', label: 'Godot', kind: 'app', weight: 1, proc: /(?:Godot[^/]*\.app\/Contents\/MacOS\/Godot|\/godot)(?:\s|$)/i, installed: ['/Applications/Godot.app', '/Applications/Godot_mono.app'] },
+  { key: 'unreal-editor', label: 'Unreal editor', kind: 'app', weight: 3, proc: /UnrealEditor(?:\s|$)/, installed: ['/Users/Shared/Epic Games'] },
+  { key: 'figma', label: 'Figma desktop', kind: 'app', weight: 1, proc: /Figma\.app\/Contents\/MacOS\/Figma(?:\s|$)/, installed: ['/Applications/Figma.app'] },
+  { key: 'chrome', label: 'Chrome', kind: 'browser', weight: 1, proc: /Google Chrome\.app\/Contents\/MacOS\/Google Chrome(?:\s|$)/, installed: ['/Applications/Google Chrome.app'] },
+];
+/** An Xcode build is heavy: capacity is how many may run at once on this machine (a quarter of its cores), weight what each costs. */
+const XCODE = { key: 'xcode-build', label: 'Xcode build', kind: 'service', weight: 3 };
+const IOS_SIM = { key: 'ios-simulator', label: 'iOS simulators', kind: 'simulator', weight: 1 };
+const ANDROID_EMU = { key: 'android-emulator', label: 'Android emulators', kind: 'simulator', weight: 2 };
+/** A Claude Code MCP server's name says which resource it drives. */
+const MCP_LINKS = [
+  [/unity/i, 'unity-editor'],
+  [/blender/i, 'blender'],
+  [/godot/i, 'godot'],
+  [/unreal/i, 'unreal-editor'],
+  [/figma/i, 'figma'],
+  [/chrome/i, 'chrome'],
+  [/ios|simulator/i, 'ios-simulator'],
+  [/android|adb/i, 'android-emulator'],
+  [/xcode/i, 'xcode-build'],
+];
+const SCAN_SLOW_MS = 120_000;
+const SKIP_DIRS = new Set(['node_modules', 'Library', 'Temp', 'Logs', 'Builds', 'obj', 'build', 'dist', 'Pods', 'DerivedData']);
+
+const isDir = (p) => {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+};
+const exists = (p) => {
+  try {
+    fs.accessSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+};
+const onPath = (cmd) => run(process.platform === 'win32' ? 'where' : 'which', [cmd]).ok;
+/** A folder with files in it (Unity Hub's Editor folder holds one folder per installed version). */
+const nonEmptyDir = (p) => {
+  try {
+    return fs.readdirSync(p).filter((n) => !n.startsWith('.')).length > 0;
+  } catch {
+    return false;
+  }
+};
+
+/** Unity project folders in a repo: a ProjectSettings/ProjectVersion.txt, the repo itself or up to three folders down. */
+function findUnityFolders(repo) {
+  const found = [];
+  const walk = (dir, depth) => {
+    if (exists(path.join(dir, 'ProjectSettings', 'ProjectVersion.txt'))) return void found.push(dir);
+    if (depth >= 3) return;
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) if (e.isDirectory() && !e.name.startsWith('.') && !SKIP_DIRS.has(e.name)) walk(path.join(dir, e.name), depth + 1);
+  };
+  walk(repo, 0);
+  return found;
+}
+
+/** The processes running now: pid, cpu and the command line. One `ps` per heartbeat. */
+function processes() {
+  const r = run('ps', ['-axo', 'pid=,pcpu=,command='], { maxBuffer: 16 * 1024 * 1024 });
+  if (!r.ok) return [];
+  return r.out
+    .split('\n')
+    .map((l) => {
+      const m = l.match(/^\s*(\d+)\s+([\d.]+)\s+(.*)$/);
+      return m ? { pid: Number(m[1]), cpu: Number(m[2]), cmd: m[3] } : null;
+    })
+    .filter(Boolean);
+}
+
+/** Maps a folder to the project whose repo holds it (the longest repo path that contains it). */
+function projectOfFolder(folder, projects) {
+  const f = path.resolve(folder);
+  let best = null;
+  for (const p of projects) {
+    const r = path.resolve(p.repoPath);
+    if ((f === r || f.startsWith(r + path.sep)) && (!best || r.length > path.resolve(best.repoPath).length)) best = p;
+  }
+  return best?.key ?? null;
+}
+
+/** The names of the MCP servers Claude Code is configured with: the user's, each folder's and each project repo's .mcp.json. */
+function mcpServerNames(projects) {
+  const names = new Set();
+  const add = (o) => Object.keys(o?.mcpServers ?? {}).forEach((n) => names.add(n));
+  const j = readJson(CLAUDE_JSON);
+  add(j);
+  for (const proj of Object.values(j?.projects ?? {})) add(proj);
+  for (const p of projects) add(readJson(path.join(p.repoPath, '.mcp.json')));
+  return [...names];
+}
+
+function simulators() {
+  const r = run('xcrun', ['simctl', 'list', 'devices', 'available', '--json'], { timeout: 15_000 });
+  if (!r.ok) return null;
+  let devices;
+  try {
+    devices = JSON.parse(r.out).devices ?? {};
+  } catch {
+    return null;
+  }
+  const out = [];
+  for (const [runtime, list] of Object.entries(devices)) {
+    const m = runtime.match(/iOS-(\d+(?:-\d+)*)$/);
+    if (!m) continue;
+    for (const d of list) if (d.isAvailable !== false) out.push({ name: `${d.name} · iOS ${m[1].replace(/-/g, '.')}`, udid: d.udid, booted: d.state === 'Booted', v: m[1] });
+  }
+  // the newest runtime first, booted ones first within it
+  const vnum = (v) => v.split('-').reduce((n, x) => n * 100 + Number(x), 0);
+  out.sort((a, b) => vnum(b.v) - vnum(a.v) || Number(b.booted) - Number(a.booted) || a.name.localeCompare(b.name));
+  return out;
+}
+
+function androidAvds() {
+  const sdk = [process.env.ANDROID_HOME, process.env.ANDROID_SDK_ROOT, path.join(os.homedir(), 'Library', 'Android', 'sdk'), path.join(os.homedir(), 'Android', 'Sdk')].filter(Boolean);
+  const bin = sdk.map((d) => path.join(d, 'emulator', 'emulator')).find(exists) ?? (onPath('emulator') ? 'emulator' : null);
+  if (!bin) return null;
+  const r = run(bin, ['-list-avds'], { timeout: 15_000 });
+  return r.ok
+    ? r.out
+        .split('\n')
+        .map((l) => l.trim())
+        .filter((l) => l && !/^(INFO|WARNING|ERROR)\b/.test(l))
+    : null;
+}
+
+function memFreePct() {
+  const total = os.totalmem();
+  if (process.platform === 'darwin') {
+    const r = run('vm_stat');
+    const page = Number((r.out.match(/page size of (\d+) bytes/) ?? [])[1]);
+    const n = (label) => Number((r.out.match(new RegExp(`${label}:\\s+(\\d+)`)) ?? [])[1] ?? 0);
+    // free + inactive + speculative pages are memory a new program can have (the cache gives way)
+    if (r.ok && page) return Math.min(100, Math.round(((n('Pages free') + n('Pages inactive') + n('Pages speculative')) * page * 100) / total));
+  }
+  return Math.round((os.freemem() * 100) / total);
+}
+
+/** What does not change by the minute: installs, Unity project folders, pools and MCP names. Scanned every SCAN_SLOW_MS. */
+let slowCache = { at: 0, key: '', value: null };
+function slowScan(projects) {
+  const key = projects.map((p) => `${p.key}=${p.repoPath}`).join('|');
+  if (slowCache.value && slowCache.key === key && Date.now() - slowCache.at < SCAN_SLOW_MS) return slowCache.value;
+  const mac = process.platform === 'darwin';
+  const installed = {};
+  for (const a of APPS) installed[a.key] = a.installed.some((p) => (p.endsWith('Editor') || p.endsWith('Games') ? nonEmptyDir(p) : exists(p))) || onPath(a.key.replace(/-editor$/, ''));
+  const unity = {};
+  for (const p of projects) if (p.repoPath && isDir(p.repoPath)) for (const f of findUnityFolders(p.repoPath)) unity[p.key] ??= f;
+  const xcode = mac && run('xcode-select', ['-p']).ok && onPath('xcodebuild');
+  const value = { installed, unity, xcode, ios: mac ? simulators() : null, android: androidAvds(), mcp: mcpServerNames(projects) };
+  slowCache = { at: Date.now(), key, value };
+  return value;
+}
+
+/**
+ * What the heartbeat reports (SPM-962): the apps found (installed or open), Unity's project folders and the ones open now,
+ * the simulator and emulator pools, Xcode builds as a weighted resource, each resource's MCP servers, and the load.
+ * `workers` is how many fleet workers run now (each counts 1 in the running weight).
+ */
+function scanMachine(projects, workers) {
+  const slow = slowScan(projects);
+  const procs = processes();
+  const cpus = os.cpus().length || 1;
+  const servers = (key) => slow.mcp.filter((n) => MCP_LINKS.find(([re]) => re.test(n))?.[1] === key);
+  const tools = [];
+  const heavy = []; // [weight, label] of what is open now
+  for (const a of APPS) {
+    // the editor itself: not a helper, Unity Hub, or an asset-import worker (Unity starts several of these per project)
+    const open = procs.filter((p) => a.proc.test(p.cmd) && !/Helper|Unity Hub/.test(p.cmd.split(' -')[0]) && !/-name AssetImportWorker|-adb2/.test(p.cmd));
+    if (!slow.installed[a.key] && !open.length) continue;
+    const t = { key: a.key, label: a.label, kind: a.kind, weight: a.weight, installed: true, open: open.length > 0, mcp_servers: servers(a.key) };
+    if (a.key === 'unity-editor') {
+      t.project_folders = slow.unity;
+      const openFolders = open
+        .map((p) => (p.cmd.match(/-(?:projectpath|createproject)\s+(.+?)(?=\s+-[A-Za-z]|$)/i) ?? [])[1])
+        .filter(Boolean)
+        .map((f) => f.replace(/^"|"$/g, ''));
+      t.open_projects = [...new Set(openFolders.map((f) => projectOfFolder(f, projects)).filter(Boolean))];
+      if (open.length) heavy.push([a.weight * open.length, `${open.length > 1 ? `${open.length} ` : ''}${a.label}`]);
+    } else if (open.length) heavy.push([a.weight, a.label]);
+    tools.push(t);
+  }
+  if (slow.xcode) {
+    const building = procs.filter((p) => /(?:^|\/)xcodebuild(?:\s|$)/.test(p.cmd));
+    tools.push({ ...XCODE, installed: true, open: building.length > 0, capacity: Math.max(1, Math.min(8, Math.floor(cpus / 4))), mcp_servers: servers(XCODE.key) });
+    if (building.length) heavy.push([XCODE.weight * building.length, `${building.length} Xcode build${building.length === 1 ? '' : 's'}`]);
+  }
+  if (slow.ios?.length) {
+    const booted = slow.ios.filter((i) => i.booted).length;
+    tools.push({ ...IOS_SIM, installed: true, open: booted > 0, capacity: slow.ios.length, instances: slow.ios.slice(0, 64).map((i) => ({ name: i.name, udid: i.udid })), mcp_servers: servers(IOS_SIM.key) });
+    if (booted) heavy.push([booted * IOS_SIM.weight, `${booted} simulator${booted === 1 ? '' : 's'} booted`]);
+  }
+  if (slow.android?.length) {
+    const running = procs.filter((p) => /(?:^|\/)(?:qemu-system|emulator)[^ ]*(?:\s|$)/.test(p.cmd) && /-avd\s/.test(p.cmd)).length;
+    tools.push({ ...ANDROID_EMU, installed: true, open: running > 0, capacity: slow.android.length, instances: slow.android.slice(0, 64).map((name) => ({ name })), mcp_servers: servers(ANDROID_EMU.key) });
+    if (running) heavy.push([running * ANDROID_EMU.weight, `${running} emulator${running === 1 ? '' : 's'} running`]);
+  }
+  const cpuPct = Math.round((os.loadavg()[0] * 100) / cpus);
+  const runningWeight = workers + heavy.reduce((n, [w]) => n + w, 0);
+  const note = [workers ? `${workers} worker${workers === 1 ? '' : 's'}` : null, ...heavy.map(([w, l]) => `${l} ${w}`)].filter(Boolean).join(' · ');
+  return { tools, machine: { cpus, cpu_pct: cpuPct, mem_free_pct: memFreePct(), running_weight: runningWeight, running_note: note || null } };
+}
+
+/** One resource as a line, the way list_tools words it: "Unity editor (unity-editor) · open on SOC · 1/1 · held by …; queue: …". */
+function resourceLine(t) {
+  const ago = (iso) => {
+    const m = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 60_000));
+    return m < 1 ? 'just now' : m < 60 ? `${m} min ago` : `${Math.floor(m / 60)} h ${m % 60} min ago`;
+  };
+  const state = !t.installed ? 'not installed' : t.open ? `open${t.openProjects?.length ? ` on ${t.openProjects.join(', ')}` : ''}` : t.kind === 'app' || t.kind === 'browser' ? 'closed' : t.kind;
+  const holders = t.holders.length ? t.holders.map((h) => `${h.name}${h.task ? ` on ${h.task}` : ''}${h.instance ? ` [${h.instance}]` : ''} since ${ago(h.since)}`).join('; ') : 'free';
+  const queue = t.queue.length ? ` · queue: ${t.queue.map((q) => `${q.position}. ${q.name}${q.task ? ` on ${q.task}` : ''} (waiting since ${ago(q.waitingSince)})`).join(', ')}` : '';
+  const pool = t.instances?.length ? ` · ${t.instances.length} member${t.instances.length === 1 ? '' : 's'}` : '';
+  const servers = t.mcpServers?.length ? ` · MCP ${t.mcpServers.join(', ')}` : '';
+  const where = t.scope === 'project' ? ` in ${t.owner}` : t.scope === 'person' ? ` for ${t.owner}` : '';
+  return `${t.label} (${t.key})${where} · ${state} · ${t.used}/${t.capacity}${t.weight > 1 ? ` × weight ${t.weight}` : ''}${pool} · ${holders}${queue}${t.needsPerson ? ` · needs a person: ${t.needsPerson}` : ''}${servers}`;
+}
+
+/** The resources by scope (machine, person, workspace, project), each with its holders and queue. */
+async function printResources() {
+  let list;
+  try {
+    list = (await api('GET', '/fleet/resources')).resources;
+  } catch (e) {
+    return console.log(`Resources: not available (${e.message})`);
+  }
+  if (!list?.length) return console.log("Resources: none reported yet. The launcher lists this machine's apps and simulators on its next heartbeat.");
+  const titles = { machine: 'On the machine', person: 'For the person', workspace: 'In the workspace', project: 'In the projects' };
+  console.log('Resources:');
+  for (const scope of ['machine', 'person', 'workspace', 'project']) {
+    const here = list.filter((t) => t.scope === scope);
+    if (!here.length) continue;
+    const load = here.find((t) => t.load)?.load;
+    console.log(`  ${titles[scope]}${scope === 'machine' && here[0].machine ? ` (${here[0].machine})` : ''}${load ? ` · load ${load.cpu_pct ?? '?'}% of ${load.cpus ?? '?'} cpus, ${load.mem_free_pct ?? '?'}% memory free, running weight ${load.running_weight ?? 0}${load.running_note ? ` (${load.running_note})` : ''}` : ''}`);
+    for (const t of here) {
+      console.log(`    ${resourceLine(t)}`);
+      for (const i of t.instances ?? []) if (i.heldBy) console.log(`        ${i.name}: ${i.heldBy}`);
+    }
+  }
+}
+
+/** projectify fleet scan: what the next heartbeat would report, without a fleet (and without sending it). */
+async function scan() {
+  let projects = [];
+  try {
+    projects = (await api('GET', '/fleet/machine')).projects.filter((p) => p.repoPath && fs.existsSync(p.repoPath));
+  } catch (e) {
+    console.log(`(no project list: ${e.message}; Unity folders need the repos the board records for this machine)`);
+  }
+  const r = scanMachine(projects, 0);
+  console.log(`Machine: ${r.machine.cpus} cpus, load ${r.machine.cpu_pct}%, ${r.machine.mem_free_pct}% memory free, running weight ${r.machine.running_weight}${r.machine.running_note ? ` (${r.machine.running_note})` : ''}`);
+  if (!r.tools.length) console.log('No apps, simulators or builds found.');
+  for (const t of r.tools) {
+    const bits = [t.installed ? (t.open ? 'open' : 'installed') : 'not installed', `capacity ${t.capacity ?? 1}`, t.weight > 1 ? `weight ${t.weight}` : null, t.open_projects?.length ? `open on ${t.open_projects.join(', ')}` : null, t.mcp_servers?.length ? `MCP ${t.mcp_servers.join(', ')}` : null].filter(Boolean);
+    console.log(`  ${t.label} (${t.key}) · ${bits.join(' · ')}`);
+    for (const [k, f] of Object.entries(t.project_folders ?? {})) console.log(`      ${k}: ${untilde(f)}`);
+    if (t.instances?.length) console.log(`      ${t.instances.length} member${t.instances.length === 1 ? '' : 's'}: ${t.instances.slice(0, 4).map((i) => i.name).join(', ')}${t.instances.length > 4 ? ', …' : ''}`);
+  }
+}
+
+/** SPM-980: "3 carried over: review SPM-933, review SPM-939, land #130" */
+function carriedText(list) {
+  return `${list.length} carried over: ${list.slice(0, 6).join(', ')}${list.length > 6 ? `, +${list.length - 6} more` : ''}`;
+}
+
 async function status() {
   const s = readJson(STATE_FILE);
-  if (!s) return console.log('No fleet has run on this machine yet. Start one with: projectify fleet');
+  if (!s) {
+    console.log('No fleet has run on this machine yet. Start one with: projectify fleet');
+    return printResources();
+  }
   const live = s.pid && alive(s.pid) && !s.endedAt;
   if (!live) {
     console.log(`No fleet runs here now. The last one (${s.fleet.slice(-6)}) worked ${s.projects.join(', ')} from ${s.startedAt}${s.endedAt ? ` until ${s.endedAt}: ${s.endReason}` : ' and ended without saying why'}.`);
-    return;
+    return printResources();
   }
   console.log(`Fleet ${s.fleet.slice(-6)} runs (pid ${s.pid}) since ${s.startedAt}, working ${s.projects.join(', ')}.`);
   if (s.whenIdle) console.log(s.whenIdle === 'stop' ? 'When idle: stop' : 'When idle: keep watching');
@@ -642,7 +1258,9 @@ async function status() {
   const workers = s.workers.filter((w) => w.role !== 'coordinator');
   if (!workers.length) console.log('No worker running: it waits for ready tasks.');
   for (const w of workers) console.log(`  ${w.label ?? `${w.role ?? 'developer'} ${w.task ?? w.project}`}  ${detail(w)}`);
+  if (s.carried?.length) console.log(`Carried over from a stopped run: ${carriedText(s.carried)}`);
   console.log(`Log: ${untilde(LOG_FILE)}`);
+  await printResources();
 }
 
 async function stop(o) {
@@ -827,6 +1445,7 @@ const HELP = `projectify ${pluginVersion()}: the Projectify fleet launcher
   projectify fleet doctor            Check this machine and every fleet project, one fix line each
   projectify fleet status            What the fleet on this machine is doing
   projectify fleet stop [--now]      Stop it after the current tasks (or now)
+  projectify fleet scan              The apps, simulators and load this machine reports (nothing is sent)
   projectify setup-machine [DIRS…]   Put projectify on your PATH, find your project repos under DIRS
                                      (default ${DEFAULT_FOLDERS.join(' ')}), record and trust them
 
@@ -839,6 +1458,7 @@ async function main() {
     const sub = rest[0];
     if (sub === 'doctor') return doctor();
     if (sub === 'status') return status();
+    if (sub === 'scan') return scan();
     if (sub === 'stop') return stop(parseFleetArgs(rest.slice(1)));
     return fleet(parseFleetArgs(rest));
   }

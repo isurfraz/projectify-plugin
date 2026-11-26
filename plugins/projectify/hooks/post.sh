@@ -25,7 +25,7 @@ esac
 # --session-id), so its start_session binds this session's hook events. Nothing is posted.
 if [ "$1" = SessionStart ]; then
   case "$input" in
-    *projectify-worker*|*projectify-reviewer*|*projectify-coordinator*) ;;
+    *projectify-worker*|*projectify-reviewer*|*projectify-coordinator*|*projectify-qa*) ;;
     *) exit 0 ;;
   esac
   sid=$(printf '%s' "$input" | sed -n 's/.*"session_id" *: *"\([0-9a-fA-F-]*\)".*/\1/p' | head -n 1)
