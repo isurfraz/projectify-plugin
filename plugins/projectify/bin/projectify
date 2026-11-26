@@ -30,6 +30,9 @@ const SHIM = path.join(process.env.PROJECTIFY_SHIM_DIR || path.join(os.homedir()
 
 const NEXT_WAIT_S = 25;
 const HEARTBEAT_MS = 30_000;
+// An extra heartbeat (a look-ahead report, a rescan) comes at most this often, and only with something to report:
+// a run-app need re-checked on every answer used to heartbeat several times a second and flood the API.
+const MIN_EXTRA_BEAT_MS = 10_000;
 const WATCH_MS = 10_000;
 const MIN_NODE = 18;
 const MIN_CLAUDE = '2.1.299'; // the version the SPM-191 spike ran (FLEET-PLAN §11a)
@@ -350,17 +353,49 @@ function workerTail(id) {
   return r.ok ? r.out.slice(-20_000) : '';
 }
 
-/** claude stop, then claude rm once the process has let go of its worktree lock (rm refuses while it runs). */
-async function stopWorker(id) {
+/** Like run(), but does not block the event loop: Ctrl-C and the other workers keep going meanwhile. */
+function runAsync(cmd, args, timeoutMs = 20_000, { detached = false } = {}) {
+  return new Promise((resolve) => {
+    let out = '';
+    let err = '';
+    let child;
+    try {
+      child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], detached });
+    } catch (e) {
+      return resolve({ ok: false, out: '', err: e.message });
+    }
+    const timer = setTimeout(() => child.kill('SIGKILL'), timeoutMs);
+    child.stdout.on('data', (d) => (out += d));
+    child.stderr.on('data', (d) => (err += d));
+    child.on('error', (e) => (clearTimeout(timer), resolve({ ok: false, out: '', err: e.message })));
+    child.on('close', (code) => (clearTimeout(timer), resolve({ ok: code === 0, out: out.trim(), err: err.trim() })));
+  });
+}
+
+/** claude stop only (async). */
+async function stopOnly(id) {
   if (!id) return;
-  const st = run('claude', ['stop', id]);
+  // detached: its own process group, so a Ctrl-C at the terminal does not cut the stop off; 10 s keeps the exit under 15
+  const st = await runAsync('claude', ['stop', id], 10_000, { detached: true });
+  log(`claude stop ${id}: ${st.out || st.err}`);
+}
+
+/** claude rm once the process has let go of its worktree lock (rm refuses while it runs). Async; never holds an exit. */
+async function removeWorker(id) {
+  if (!id) return;
   let rm;
   for (let i = 0; i < 15; i++) {
-    rm = run('claude', ['rm', id]);
+    rm = await runAsync('claude', ['rm', id]);
     if (rm.ok && /^removed/m.test(rm.out)) break;
     await sleep(1000);
   }
-  log(`claude stop ${id}: ${st.out || st.err} · claude rm ${id}: ${(rm.out || rm.err).replace(/\s+/g, ' ')}`);
+  log(`claude rm ${id}: ${(rm.out || rm.err).replace(/\s+/g, ' ')}`);
+}
+
+/** claude stop, then claude rm. */
+async function stopWorker(id) {
+  await stopOnly(id);
+  await removeWorker(id);
 }
 
 /**
@@ -476,6 +511,7 @@ const alive = (pid) => {
 async function fleet(o) {
   if (o.dryRun) return dryRun(o);
   const prev = readJson(STATE_FILE);
+  const leftToClean = Array.isArray(prev?.cleanup) ? prev.cleanup.filter((c) => c && c.bgId) : []; // stopped, not yet removed: { bgId, fire }
   if (prev?.pid && prev.pid !== process.pid && alive(prev.pid) && !prev.endedAt)
     die(`a fleet already runs on this machine (pid ${prev.pid}). projectify fleet status shows it; projectify fleet stop ends it.`);
 
@@ -501,20 +537,45 @@ async function fleet(o) {
   const coordinatorOn = start.projects.some((p) => p.roles && p.roles.coordinator);
   const state = { pid: process.pid, fleet: fleetId, api: apiBase(), startedAt: new Date().toISOString(), projects: start.projects.map((p) => p.key), whenIdle, coordinatorOn, inbox: null, workers: [] };
   const persist = () =>
-    saveState({ ...state, workers: [...running.values()].map((w) => ({ fire: w.fire.fire, role: roleOf(w.fire), event: w.fire.event ?? null, label: w.label, task: w.fire.task, project: w.fire.project, worktree: w.fire.worktree, branch: w.fire.branch ?? null, model: w.fire.model ?? null, effort: w.fire.effort ?? null, fallbackModel: w.fire.fallbackModel ?? null, bgId: w.bgId, since: w.since })) });
+    saveState({ ...state, cleanup: leftToClean, workers: [...running.values()].map((w) => ({ fire: w.fire.fire, role: roleOf(w.fire), event: w.fire.event ?? null, label: w.label, task: w.fire.task, project: w.fire.project, worktree: w.fire.worktree, branch: w.fire.branch ?? null, model: w.fire.model ?? null, effort: w.fire.effort ?? null, fallbackModel: w.fire.fallbackModel ?? null, bgId: w.bgId, since: w.since })) });
   persist();
+  // sessions an earlier run stopped but did not remove: tidy them in the background, never holding this start.
+  // Each stays in leftToClean (and so in fleet.json) until its own clean-up is done.
+  (async () => {
+    for (const c of leftToClean.slice()) {
+      await runAsync('claude', ['stop', c.bgId], 10_000, { detached: true });
+      await removeWorker(c.bgId);
+      try {
+        removeRoleWorktree(c.fire);
+      } catch (e) {
+        log(`tidy-up of ${c.bgId}: ${e.message}`);
+      }
+      const i = leftToClean.indexOf(c);
+      if (i >= 0) leftToClean.splice(i, 1);
+      persist();
+    }
+  })().catch(() => {});
 
   let stopping = null; // 'after_current' | 'now'
+  let nowSince = 0;
   let finished = false;
   let lastWait = '';
   const ac = new AbortController();
 
-  const endWorker = async (w, reason) => {
+  const endWorker = async (w, reason, { stopOnlyNow = false } = {}) => {
+    if (!running.has(w.fire.fire)) return; // already being ended (finish() during stop-now): no second clean-up entry or end report
     running.delete(w.fire.fire);
+    // listed for clean-up before the stop starts, so a third Ctrl-C mid-stop still names it and the next start tidies it
+    if (stopOnlyNow && w.bgId) leftToClean.push({ bgId: w.bgId, fire: w.fire });
     persist();
-    await stopWorker(w.bgId);
-    removeRoleWorktree(w.fire);
-    const r = await api('POST', `/fleet/${w.fleetId ?? fleetId}/workers/${w.fire.fire}/end`, { reason }).catch((e) => (say(`could not report the end of ${w.fire.task ?? w.fire.fire}: ${e.message}`), null));
+    if (stopOnlyNow) {
+      // stop now: the stop is all that must finish; rm and worktree removal wait (the next start tidies up)
+      await stopOnly(w.bgId);
+    } else {
+      await stopWorker(w.bgId);
+      removeRoleWorktree(w.fire);
+    }
+    const r = await api('POST', `/fleet/${w.fleetId ?? fleetId}/workers/${w.fire.fire}/end`, { reason }, stopping === 'now' ? { timeoutMs: 5_000 } : undefined).catch((e) => (say(`could not report the end of ${w.fire.task ?? w.fire.fire}: ${e.message}`), null));
     // SPM-590: what the land worker reported (an older API sends nothing)
     if (isLand(w.fire) && r && r.land)
       say(r.land.landed ? `Landed ${prs(r.land.landed)} in push ${String(r.land.commit ?? '').slice(0, 7)}${r.land.left ? ` · ${r.land.left} not merged (on the board)` : ''}` : `Landing ${w.fire.project}: nothing landed${r.land.left ? ` · ${r.land.left} back to the queue or the board` : ''}`);
@@ -553,9 +614,19 @@ async function fleet(o) {
     if (finished) return;
     finished = true;
     ac.abort();
-    if (stopping === 'now') for (const w of [...running.values()]) await endWorker(w, 'stopped now');
+    if (stopping === 'now') {
+      const all = [...running.values()];
+      let n = 0;
+      // all at once; one line per worker as it stops
+      await Promise.all(
+        all.map((w) =>
+          endWorker(w, 'stopped now', { stopOnlyNow: true }).then(() => say(`stopped ${w.label ?? w.fire.task ?? w.fire.fire} (${++n} of ${all.length})`)),
+        ),
+      );
+    }
     say(`fleet stopped: ${why}`);
-    saveState({ ...state, endedAt: new Date().toISOString(), endReason: why, workers: [] });
+    saveState({ ...state, endedAt: new Date().toISOString(), endReason: why, workers: [], cleanup: leftToClean });
+    if (leftToClean.length) say(`${leftToClean.length} stopped session${leftToClean.length === 1 ? '' : 's'} will be tidied up the next time you run projectify fleet`);
     process.exit(0);
   };
 
@@ -566,6 +637,7 @@ async function fleet(o) {
     const when = out.resetsAt ? ` (resets ${out.resetsAt})` : '';
     say(`${label}: Claude is out of credits or usage${when}. Stopping now; the board hands this fleet's work to another live fleet.`);
     stopping = 'now';
+    nowSince = Date.now(); // SPM-1004: a Ctrl-C from here on is the third one: leave at once, naming what is left
     ac.abort();
     const r = await api('POST', `/fleet/${fleetId}/stop`, { mode: 'now', reason: out.reason, ...(out.resetsAt ? { resets_at: out.resetsAt.slice(0, 120) } : {}) }).catch(
       (e) => (say(`could not tell the board: ${e.message}`), null),
@@ -573,28 +645,59 @@ async function fleet(o) {
     await finish(r?.reason ?? `out of credits or usage${when}`);
   };
 
+  const countText = () => {
+    const by = {};
+    for (const w of running.values()) {
+      const r = isLand(w.fire) ? 'landing' : roleOf(w.fire);
+      by[r] = (by[r] ?? 0) + 1;
+    }
+    const name = { developer: 'worker', reviewer: 'reviewer', coordinator: 'Coordinator', landing: 'landing', qa: 'QA' };
+    const parts = Object.entries(by).map(([r, n]) => `${n} ${name[r] ?? r}${n > 1 && r !== 'landing' && r !== 'coordinator' ? 's' : ''}`);
+    return `${running.size} running${parts.length ? `: ${parts.join(', ')}` : ''}`;
+  };
   process.on('SIGINT', async () => {
     if (!stopping) {
       stopping = 'after_current';
-      say(`stopping after the current task${running.size === 1 ? '' : 's'} (${running.size} running). Ctrl-C again to stop now.`);
+      say(`stopping after the current task${running.size === 1 ? '' : 's'} (${countText()}). Ctrl-C again to stop now.`);
       ac.abort();
       await api('POST', `/fleet/${fleetId}/stop`, { mode: 'after_current' }).catch((e) => say(`could not tell the board: ${e.message}`));
       if (!running.size) await finish('stopped from the terminal');
-    } else {
+    } else if (stopping === 'after_current') {
       stopping = 'now';
-      await api('POST', `/fleet/${fleetId}/stop`, { mode: 'now' }).catch(() => {});
-      await finish('stopped now from the terminal');
+      nowSince = Date.now();
+      say(`stopping now (${countText()}); Ctrl-C again to leave at once.`);
+      const told = api('POST', `/fleet/${fleetId}/stop`, { mode: 'now' }).catch(() => {});
+      await Promise.all([told, finish('stopped now from the terminal')]);
+    } else if (Date.now() - nowSince > 1000) {
+      // third Ctrl-C (a second signal within a second is `projectify fleet stop --now`'s double send, not a person)
+      const left = [...running.values()];
+      for (const w of left) if (w.bgId && !leftToClean.some((c) => c.bgId === w.bgId)) leftToClean.push({ bgId: w.bgId, fire: w.fire });
+      const ids = [...new Set(leftToClean.map((c) => c.bgId))];
+      saveState({ ...state, endedAt: new Date().toISOString(), endReason: 'left at once from the terminal', workers: [], cleanup: leftToClean });
+      say(`leaving at once.${ids.length ? ` Sessions that may still run: ${ids.join(', ')}.` : ''} projectify fleet stop --now or claude stop <id> ends them; the next projectify fleet tidies up.`);
+      process.exit(1);
     }
   });
   process.on('SIGTERM', () => process.emit('SIGINT'));
 
   // heartbeat: what runs, every 30 s; it also carries a stop from the web app
   const pendingEvents = []; // lease events (SPM-967) the next heartbeat reports
-  let rescanning = false;
   // SPM-992: opens what the ready tasks need and checks sign-ins; a finished check asks for a heartbeat at once
   let beat = () => {};
   const lookAhead = makeLookAhead({ onReport: () => beat() });
+  let lastBeatAt = 0;
+  let extraBeat = null; // the one extra heartbeat waiting, if any
+  const soonBeat = (why) => {
+    if (extraBeat) return;
+    const wait = Math.max(0, lastBeatAt + MIN_EXTRA_BEAT_MS - Date.now());
+    extraBeat = setTimeout(() => {
+      extraBeat = null;
+      heartbeat().catch((e) => log(`${why} heartbeat failed: ${e.message}`));
+    }, wait);
+    extraBeat.unref?.();
+  };
   const heartbeat = async () => {
+    lastBeatAt = Date.now();
     // SPM-962: the apps, simulators and load of this machine; a failed scan must never cost the heartbeat
     let found = { tools: undefined, machine: undefined };
     try {
@@ -629,13 +732,7 @@ async function fleet(o) {
     }
     if (r?.toolWork) pendingEvents.push(...applyToolWork(r.toolWork));
     // SPM-957: Fleet setup's Rescan: scan and report again now, not at the next beat
-    if (r?.rescan && !rescanning) {
-      rescanning = true;
-      setTimeout(() => {
-        rescanning = false;
-        heartbeat().catch((e) => log(`rescan heartbeat failed: ${e.message}`));
-      }, 100);
-    }
+    if (r?.rescan) soonBeat('rescan');
     if (r?.stopped && silentStop(r.reason)) {
       await revive(r.reason);
     } else if (r?.stopped) {
@@ -648,7 +745,7 @@ async function fleet(o) {
       if (stopping === 'now' || !running.size) await finish('stopped from the board');
     }
   };
-  beat = () => heartbeat().catch((e) => log(`look-ahead heartbeat failed: ${e.message}`));
+  beat = () => lookAhead.pending() && soonBeat('look-ahead');
   const hb = setInterval(heartbeat, HEARTBEAT_MS);
   hb.unref();
   heartbeat().catch((e) => log(`first heartbeat failed: ${e.message}`)); // the machine's resources show at once, not after 30 s
@@ -1353,6 +1450,8 @@ function makeLookAhead({ onReport }) {
     },
     /** The reports to send with the next heartbeat (taken once). */
     take: () => reports.splice(0, 64),
+    /** Whether a report waits for the next heartbeat. */
+    pending: () => reports.length > 0,
     /** Put reports back when the heartbeat failed. */
     putBack: (list) => reports.unshift(...list),
   };
