@@ -7,7 +7,8 @@
 #
 # Fails open: no token, no network, or any odd reply allows the call (with a warning when the API is unreachable).
 
-data="${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/projectify-projectify}"
+# SPM-1146: a desktop-run fleet puts the token in PROJECTIFY_DATA_DIR
+data="${PROJECTIFY_DATA_DIR:-${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/projectify-projectify}}"
 token=$(cat "$data/token" 2>/dev/null)
 [ -n "$token" ] || exit 0
 
@@ -42,10 +43,20 @@ else
 fi
 api="${api%/v1}"
 
-reply=$(curl -sf --max-time 5 -G \
+# SPM-1152: the status rides on the last line, so a refused token is told apart from an unreachable server
+out=$(curl -s --max-time 5 -G -w '\n%{http_code}' \
   -H "authorization: Bearer $token" \
   --data-urlencode "session=$sid" --data-urlencode "server=$server" \
   "$api/v1/tools/check" 2>/dev/null)
+code=$(printf '%s\n' "$out" | tail -n 1)
+reply=$(printf '%s\n' "$out" | sed '$d')
+case "$code" in
+  401|403)
+    printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"Projectify refused the machine token, so the lease on this tool was not checked and the call was allowed. Run /projectify:setup on this machine."}}'
+    exit 0 ;;
+  2??) ;;
+  *) reply= ;;
+esac
 if [ -z "$reply" ]; then
   printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"Projectify could not be reached to check the lease on this tool; the call was allowed."}}'
   exit 0

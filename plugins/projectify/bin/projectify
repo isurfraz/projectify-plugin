@@ -167,6 +167,9 @@ function apiBase() {
   return url.replace(/\/mcp\/?$/, '') + '/v1';
 }
 
+/** SPM-1146: the hooks read only the token file (in PROJECTIFY_DATA_DIR or the plugin's data folder), never PROJECTIFY_TOKEN. */
+const hooksMissToken = () => !!process.env.PROJECTIFY_TOKEN?.trim() && !fs.existsSync(TOKEN_FILE);
+
 function token() {
   const env = process.env.PROJECTIFY_TOKEN?.trim();
   if (env) return env;
@@ -253,10 +256,39 @@ function trust(dirs) {
   j.projects ??= {};
   for (const d of dirs) j.projects[d] = { ...(j.projects[d] ?? {}), hasTrustDialogAccepted: true };
   const tmp = `${CLAUDE_JSON}.projectify-${process.pid}`;
-  fs.writeFileSync(tmp, JSON.stringify(j, null, 2));
-  fs.renameSync(tmp, CLAUDE_JSON);
-  return true;
+  // SPM-1164: a config we cannot write (read-only, EACCES) falls back to the caller's friendly line
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(j, null, 2));
+    fs.renameSync(tmp, CLAUDE_JSON);
+    return true;
+  } catch (e) {
+    log(`could not write ${CLAUDE_JSON}: ${e.message}`);
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      // nothing to clean up
+    }
+    return false;
+  }
 }
+
+/**
+ * SPM-1159: PROJECTIFY_CLAUDE_ARGS (plugin development: extra claude arguments as a JSON array of strings, e.g.
+ * ["--plugin-dir", "~/src/projectify-plugin"]), checked once at start; a leading ~/ is expanded.
+ */
+function claudeExtraArgs() {
+  const raw = process.env.PROJECTIFY_CLAUDE_ARGS;
+  if (!raw) return [];
+  let v;
+  try {
+    v = JSON.parse(raw);
+  } catch (e) {
+    die(`PROJECTIFY_CLAUDE_ARGS is not valid JSON (${e.message}); it takes an array of strings, e.g. ["--plugin-dir", "~/src/projectify-plugin"]`);
+  }
+  if (!Array.isArray(v) || !v.every((a) => typeof a === 'string')) die('PROJECTIFY_CLAUDE_ARGS takes a JSON array of strings, e.g. ["--plugin-dir", "~/src/projectify-plugin"]');
+  return v.map((a) => (a.startsWith('~/') ? path.join(os.homedir(), a.slice(2)) : a));
+}
+let CLAUDE_EXTRA_ARGS = [];
 
 // ---------------------------------------------------------------------------------------------
 // claude: background workers
@@ -290,8 +322,8 @@ function startWorker(fire) {
   if (READ_ONLY_ROLES.has(role)) args.push('--disallowedTools', READ_ONLY_DISALLOWED);
   args.push('--settings', JSON.stringify(isLand(fire) ? landSettings() : workerSettings()));
   args.push('--agent', ROLE_AGENTS[role]());
-  // plugin development: extra claude arguments as a JSON array, e.g. ["--plugin-dir", "~/src/projectify-plugin"]
-  if (process.env.PROJECTIFY_CLAUDE_ARGS) args.push(...JSON.parse(process.env.PROJECTIFY_CLAUDE_ARGS));
+  // plugin development: extra claude arguments (SPM-1159: checked once at start)
+  args.push(...CLAUDE_EXTRA_ARGS);
   args.push(fire.payload);
   return new Promise((resolve, reject) => {
     let out = '';
@@ -445,7 +477,9 @@ function parseFleetArgs(argv) {
     else if (a === '--dry-run') o.dryRun = true;
     else if (a === '--now') o.now = true;
     else if (a.startsWith('-')) die(`unknown option ${a} (projectify help)`);
-    else o.keys.push(a.toUpperCase());
+    // SPM-1157: a project key is 2 to 5 letters (packages/shared schemas); anything else is a mistyped command
+    else if (/^[A-Za-z]{2,5}$/.test(a)) o.keys.push(a.toUpperCase());
+    else die(`${a} is not a fleet command or a project key (projectify fleet help)`);
   }
   if (o.workers != null && !(Number.isInteger(o.workers) && o.workers >= 1)) die('--workers takes a whole number, 1 or more');
   if (o.watch && o.untilEmpty) die('--watch and --until-empty contradict each other: pick one');
@@ -516,26 +550,51 @@ async function dryRun(o) {
   }
 }
 
+/** SPM-1148: write to a temp file and rename, so the desktop (which reads it every 2 s) never sees half a file; a disk error is logged, not thrown. */
 function saveState(s) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2));
-}
-const alive = (pid) => {
+  const tmp = `${STATE_FILE}.${process.pid}`;
   try {
-    process.kill(pid, 0);
-    return true;
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(s, null, 2));
+    fs.renameSync(tmp, STATE_FILE);
+  } catch (e) {
+    log(`could not write ${STATE_FILE}: ${e.message}`);
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      // nothing to clean up
+    }
+  }
+}
+/**
+ * The fleet in fleet.json (state `s`: its pid and startedAt) still runs. SPM-1142: after a crash or reboot the OS can
+ * hand that pid to another program, which started after the fleet did. The start time, not the name, tells them
+ * apart: a desktop-run fleet's process is "Projectify Helper" (or "Electron Helper" in dev).
+ */
+const alive = (s) => {
+  try {
+    process.kill(s.pid, 0);
   } catch {
     return false;
   }
+  const since = Date.parse(s.startedAt ?? '');
+  if (!Number.isFinite(since)) return true;
+  // no ps (Windows), or an answer we cannot read: the signal check is all there is
+  const ps = run('ps', ['-p', String(s.pid), '-o', 'lstart='], { env: { ...process.env, LC_ALL: 'C' } });
+  const began = ps.ok ? Date.parse(ps.out) : NaN;
+  if (!Number.isFinite(began)) return true;
+  // lstart has whole seconds, and on Linux it moves when the wall clock steps; a fleet's process always starts before it writes startedAt, and a reused pid comes much later
+  return began <= since + 60_000;
 };
 
 async function fleet(o) {
   if (o.dryRun) return dryRun(o);
   const prev = readJson(STATE_FILE);
   const leftToClean = Array.isArray(prev?.cleanup) ? prev.cleanup.filter((c) => c && c.bgId) : []; // stopped, not yet removed: { bgId, fire }
-  if (prev?.pid && prev.pid !== process.pid && alive(prev.pid) && !prev.endedAt)
+  if (prev?.pid && prev.pid !== process.pid && alive(prev) && !prev.endedAt)
     die(`a fleet already runs on this machine (pid ${prev.pid}). projectify fleet status shows it; projectify fleet stop ends it.`);
 
+  if (hooksMissToken()) say(`warning: the machine token comes from PROJECTIFY_TOKEN but ${untilde(TOKEN_FILE)} is missing, so the workers' hooks cannot reach the board (permission prompts stay in the terminal). Run /projectify:setup on this machine.`);
   // whenIdle only when a flag says so; otherwise the server uses this machine's setting (People › Fleet)
   const whenIdleFlag = o.untilEmpty ? 'stop' : o.watch ? 'watch' : undefined;
   const start = await api('POST', '/fleet/start', { projects: o.keys.length ? o.keys : null, workers: o.workers, untilEmpty: o.untilEmpty, ...(whenIdleFlag ? { whenIdle: whenIdleFlag } : {}), plugin_version: pluginVersion() });
@@ -1483,7 +1542,7 @@ function makeLookAhead({ onReport }) {
   async function checkSites(batch) {
     checking = true;
     const claudeArgs = ['-p', '--chrome', '--strict-mcp-config', '--model', 'haiku', '--no-session-persistence', '--output-format', 'text', '--allowedTools', SITE_CHECK_ALLOWED.join(','), '--disallowedTools', SITE_CHECK_DENIED.join(','), '--tools', ''];
-    if (process.env.PROJECTIFY_CLAUDE_ARGS) claudeArgs.push(...JSON.parse(process.env.PROJECTIFY_CLAUDE_ARGS));
+    claudeArgs.push(...CLAUDE_EXTRA_ARGS);
     // '--' ends the options: --disallowedTools takes many values and would read the prompt as one more tool name
     claudeArgs.push('--', siteCheckPrompt(batch));
     for (const x of batch) said(x.need, 'opening', 'opening the page and checking the sign-in');
@@ -1897,7 +1956,7 @@ async function status() {
     console.log('No fleet has run on this machine yet. Start one with: projectify fleet');
     return printResources();
   }
-  const live = s.pid && alive(s.pid) && !s.endedAt;
+  const live = s.pid && alive(s) && !s.endedAt;
   if (!live) {
     console.log(`No fleet runs here now. The last one (${s.fleet.slice(-6)}) worked ${s.projects.join(', ')} from ${s.startedAt}${s.endedAt ? ` until ${s.endedAt}: ${s.endReason}` : ' and ended without saying why'}.`);
     return printResources();
@@ -1929,13 +1988,13 @@ async function status() {
 
 async function stop(o) {
   const s = readJson(STATE_FILE);
-  if (!s || s.endedAt || !s.pid || !alive(s.pid)) return console.log('No fleet runs on this machine.');
+  if (!s || s.endedAt || !s.pid || !alive(s)) return console.log('No fleet runs on this machine.');
   const mode = o.now ? 'now' : 'after_current';
   await api('POST', `/fleet/${s.fleet}/stop`, { mode }).catch((e) => console.log(`could not tell the board (${e.message}); stopping the launcher anyway`));
   process.kill(s.pid, 'SIGINT');
   if (o.now) {
     await sleep(300);
-    if (alive(s.pid)) process.kill(s.pid, 'SIGINT');
+    if (alive(s)) process.kill(s.pid, 'SIGINT');
   }
   console.log(o.now ? 'Stopping now: running workers are stopped.' : 'Stopping after the current tasks. projectify fleet stop --now stops them too.');
 }
@@ -1972,6 +2031,8 @@ async function doctor() {
 
   let machine = null;
   const t = token();
+  // SPM-1146: the hooks need the file even when the launcher gets the token from the environment
+  if (process.env.PROJECTIFY_TOKEN?.trim()) check('Token file for the hooks', !hooksMissToken(), hooksMissToken() ? `PROJECTIFY_TOKEN is set but ${untilde(TOKEN_FILE)} is missing` : untilde(TOKEN_FILE), 'Run /projectify:setup in Claude Code on this machine, so the hooks can post permission prompts to the board.');
   if (!t) check('Machine token', false, `no token at ${untilde(TOKEN_FILE)}`, 'Run /projectify:setup in Claude Code on this machine.');
   else
     try {
@@ -2124,6 +2185,9 @@ async function main() {
     if (sub === 'status') return status();
     if (sub === 'scan') return scan();
     if (sub === 'stop') return stop(parseFleetArgs(rest.slice(1)));
+    // SPM-1157: help under fleet, and a misspelt subcommand is not a project key
+    if (sub === 'help' || sub === '--help' || sub === '-h') return console.log(HELP);
+    CLAUDE_EXTRA_ARGS = claudeExtraArgs();
     return fleet(parseFleetArgs(rest));
   }
   if (cmd === 'setup-machine') return setupMachine(rest);

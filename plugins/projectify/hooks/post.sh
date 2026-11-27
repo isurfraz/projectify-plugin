@@ -10,7 +10,8 @@
 # person's own chats are never changed. Without a token, or outside a worktree, it posts nothing.
 # Any failure prints nothing, so Claude Code falls back to its own behaviour (a terminal prompt).
 
-data="${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/projectify-projectify}"
+# SPM-1146: a desktop-run fleet puts the token in PROJECTIFY_DATA_DIR
+data="${PROJECTIFY_DATA_DIR:-${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/projectify-projectify}}"
 token=$(cat "$data/token" 2>/dev/null)
 [ -n "$token" ] || exit 0
 
