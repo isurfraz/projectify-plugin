@@ -19,7 +19,7 @@ For Claude Code on the web and cloud sessions, add Projectify as a connector on 
 - A SessionStart hook: in any git repo it names the remote so Claude finds the project; quiet where the repo has its own Projectify hook.
 - Skills: `projectify`, `projectify-plan`, `projectify-next`, `projectify-handoff`, `projectify-learn`.
 - `/projectify:setup`: a few skippable questions, then Claude sets up your workspace and first project, and (optional) the fleet on this machine.
-- The fleet: `projectify fleet` works the ready tasks of every project with the fleet on, one `projectify-worker` background session per task, each ending in a branch, a pull request and the task in In review. `projectify fleet doctor` checks this machine.
+- The fleet: `projectify fleet` works the epics of every project with the fleet on, one `projectify-agent` background session per epic, each taking its epic from research to shipped. `projectify fleet doctor` checks this machine.
 
 ## Run the fleet
 
@@ -39,12 +39,12 @@ projectify fleet --until-empty   # exit when nothing is left to take or answer
 projectify fleet --watch         # keep watching when idle (costs no tokens)
 ```
 
-   Without --watch or --until-empty, the machine's "When there is nothing to do" setting in People › Fleet decides; the header says which. It prints the projects it works and the ones it skips (and why), then one line per event. Each worker takes one task in its own worktree, pushes a branch, opens a pull request, moves the task to the In review group and leaves a handoff. Workers never merge; where merging is on (People › Fleet › Merging defaults, or the project's Project settings › Fleet), a PR the Reviewer passes that touches nothing risky joins a merge queue, and the fleet lands the queue in one push to main ("Landing 3 PRs in one push"). A risky step, like a push to main, waits as an approval in Needs you on the web.
+   Without --watch or --until-empty, the machine's "When there is nothing to do" setting in People › Fleet decides; the header says which. It prints the projects it works and the ones it skips (and why), then one line per event. Each worker is a full agent that takes one epic in its own worktree and does every step itself: research and define, plan, design, build, test, a fresh-eyes review by a subagent, and ship. Where merging is on (People › Fleet › Merging defaults, or the project's Project settings › Fleet) it merges its own PRs, one agent at a time; where it is off it leaves each PR In review for you. A risky step waits as an approval in Needs you on the web.
 5. **Watch and stop:** `projectify fleet status` shows the workers; the project Overview and People › Fleet show the live fleet. Ctrl-C once stops after the current tasks, twice stops now; `projectify fleet stop [--now]` does the same from another terminal, and so does Stop on the live fleet in the web app.
 
-**Roles:** developers build tasks (a planner first for plan-first sizes). With Reviewer on in a project's Project settings › Fleet, a `projectify-reviewer` checks each pull request and either leaves it ready for you (or, with merging on, queues it to merge unless it is risky) or sends a developer back to the same branch with notes. With the Coordinator on, a `projectify-coordinator` answers workers' questions, decides approvals and replies to your comments on fleet tasks within the policy you set per category (decides, recommends, or leaves it to you). Reviewer and Coordinator never edit code.
+**Full agents (Fleet 5):** there are no separate roles. Each worker slot is one `projectify-agent` that owns an epic end to end, so 2 workers work 2 epics side by side. Agents talk to each other through the project room and task comments, and decide for themselves what the task leaves open, writing "Assumed: …" on the task; only questions nobody but you can answer wait for you.
 
-**What it takes:** any task Start next would hand an agent: ready, unblocked, unclaimed and not needing a person, in a project with the fleet on, in Start next's order, taking turns across projects. Never an epic. Sizes set to plan first get a planning worker before the one that builds.
+**What it takes:** epics, one agent each: an open epic with a ready task (unblocked, unclaimed and not needing a person) or with no tasks yet to flesh out, in a project with the fleet on, in Start next's order, taking turns across projects. Ready tasks in no epic are gathered into the project's Loose tasks epic.
 
 **When something is off,** run `projectify fleet doctor`: one line per check, each with its fix. Three fixes are yours, in a terminal: `claude auth login` when Claude Code's own sign-in has expired (workers then stop on "OAuth session expired"), `claude mcp login plugin:projectify:projectify` (or `/mcp` → plugin:projectify:projectify → Authenticate) once, and `gh auth login`.
 

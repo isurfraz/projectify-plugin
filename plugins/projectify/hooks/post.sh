@@ -21,11 +21,11 @@ case "$input" in
   *) exit 0 ;;
 esac
 
-# SessionStart: tell a fleet session (worker, reviewer or coordinator, SPM-503) its own session id (an agent body gets no ${CLAUDE_SESSION_ID}, and --bg ignores
+# SessionStart: tell a fleet session (SPM-1072: the full agent; older: worker, reviewer, coordinator, SPM-503) its own session id (an agent body gets no ${CLAUDE_SESSION_ID}, and --bg ignores
 # --session-id), so its start_session binds this session's hook events. Nothing is posted.
 if [ "$1" = SessionStart ]; then
   case "$input" in
-    *projectify-worker*|*projectify-reviewer*|*projectify-coordinator*|*projectify-qa*) ;;
+    *projectify-agent*|*projectify-worker*|*projectify-reviewer*|*projectify-coordinator*|*projectify-qa*) ;;
     *) exit 0 ;;
   esac
   sid=$(printf '%s' "$input" | sed -n 's/.*"session_id" *: *"\([0-9a-fA-F-]*\)".*/\1/p' | head -n 1)

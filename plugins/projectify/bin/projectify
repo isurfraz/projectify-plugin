@@ -73,10 +73,13 @@ const WORKER_ENV = { ENABLE_CLAUDEAI_MCP_SERVERS: 'false' };
 const quota = () => readJson(path.join(DATA_DIR, 'quota.json'));
 
 // SPM-503 (Fleet 3): each fire has a role. An older API sends none: a planning step is the planner, the rest developers.
-const ROLES = ['planner', 'developer', 'reviewer', 'coordinator', 'qa'];
+// SPM-1072 (D-144, Fleet 5): the API now sends only role agent, a full agent that owns one epic; the older roles stay
+// readable for a fire an older API sends.
+const ROLES = ['agent', 'planner', 'developer', 'reviewer', 'coordinator', 'qa'];
 const roleOf = (fire) => (ROLES.includes(fire?.role) ? fire.role : fire?.step === 'planning' ? 'planner' : 'developer');
 /** The plugin agent each role starts with; PROJECTIFY_<WORKER|REVIEWER|COORDINATOR>_AGENT overrides it (plugin development). */
 const ROLE_AGENTS = {
+  agent: () => process.env.PROJECTIFY_AGENT_AGENT || 'projectify:projectify-agent',
   planner: () => process.env.PROJECTIFY_WORKER_AGENT || 'projectify:projectify-worker',
   developer: () => process.env.PROJECTIFY_WORKER_AGENT || 'projectify:projectify-worker',
   reviewer: () => process.env.PROJECTIFY_REVIEWER_AGENT || 'projectify:projectify-reviewer',
@@ -109,6 +112,7 @@ function fireLabel(fire, inbox) {
     return `coordinator${n ? `: ${n} item${n === 1 ? '' : 's'}` : ''}`;
   }
   const what = fire.task ?? `${fire.project} (${fire.event})`;
+  if (role === 'agent') return `agent ${what} (epic)`;
   if (role === 'reviewer') return `reviewer ${what}${roundOf(fire) ? ` round ${roundOf(fire)}` : ''}`;
   if (role === 'developer' && fire.branch) return `developer ${what} (rework on ${fire.branch})`;
   return `${role} ${what}`;
@@ -450,7 +454,8 @@ const COORDINATOR_IDLE = 'Coordinator: inbox handled; still on duty, it wakes on
 
 /** " · roles: developer, reviewer, coordinator" when the API sends a project's roles (SPM-503), else nothing. */
 const rolesText = (roles) => {
-  if (!roles || typeof roles !== 'object') return '';
+  // SPM-1072 (D-144): every worker is a full agent, one per epic
+  if (!roles || typeof roles !== 'object' || !(roles.reviewer || roles.coordinator || roles.qa)) return ' · full agents, one epic each';
   const on = ['reviewer', 'coordinator', 'qa'].filter((r) => roles[r]).map((r) => (r === 'reviewer' && roles.merge ? 'reviewer (merges)' : r));
   return ` · roles: developer${on.length ? ', ' + on.join(', ') : ''}`;
 };
@@ -482,8 +487,21 @@ async function dryRun(o) {
   printProjects(worked.map((p) => ({ ...p, roles: p.roles ?? machine.projects.find((m) => m.key === p.key)?.roles })), skipped);
   const keys = new Set(worked.map((p) => p.key));
   const tasks = queue.tasks.filter((t) => keys.has(t.project));
-  if (!tasks.length) console.log('Nothing ready to take.');
-  else {
+  if (!tasks.length) console.log('Nothing ready in an epic (open epics with no tasks yet are also taken, to flesh out).');
+  else if (tasks.some((t) => 'epic' in t)) {
+    // SPM-1072 (D-144): a run hands out epics, one agent each; tasks in no epic go into the project's Loose tasks epic
+    const byEpic = new Map();
+    for (const t of tasks) {
+      const k = t.epic ?? `${t.project} Loose tasks`;
+      byEpic.set(k, [...(byEpic.get(k) ?? []), t]);
+    }
+    console.log(`Would take, in order (one agent per epic):`);
+    [...byEpic].forEach(([epic, ts], i) => {
+      console.log(`  ${String(i + 1).padStart(2)}. ${epic}  (${ts.length} ready task${ts.length === 1 ? '' : 's'})`);
+      for (const t of ts.slice(0, 5)) console.log(`        ${t.ref}  ${t.title}${t.size ? `  [${t.size}]` : ''}`);
+      if (ts.length > 5) console.log(`        … and ${ts.length - 5} more`);
+    });
+  } else {
     console.log(`Would take, in order:`);
     tasks.forEach((t, i) => console.log(`  ${String(i + 1).padStart(2)}. ${t.ref}  ${t.title}${t.size ? `  [${t.size}]` : ''}${t.role ? `  (${t.role})` : ''}`));
   }
@@ -529,7 +547,7 @@ async function fleet(o) {
   let fleetId = start.fleet.id;
   let maxWorkers = start.fleet.maxWorkers;
   say(`fleet ${fleetId.slice(-6)} on ${start.machine.label}: up to ${start.fleet.maxWorkers} worker${start.fleet.maxWorkers === 1 ? '' : 's'}. Ctrl-C: stop after current; twice: stop now.`);
-  say(whenIdle === 'stop' ? 'When idle: stop (once nothing is ready, running, queued or waiting for the Coordinator)' : 'When idle: keep watching (no Claude session runs until something happens)');
+  say(whenIdle === 'stop' ? 'When idle: stop (once nothing is ready, running, queued)' : 'When idle: keep watching (no Claude session runs until something happens)');
 
   /** fire id → { fire, bgId, task, since, last } */
   const running = new Map();
@@ -1766,10 +1784,10 @@ async function status() {
   // SPM-587: the Coordinator stays on duty for the whole run; its Claude session runs only while its inbox has items
   if (coord) console.log(`Coordinator: on duty, handling its inbox now  ${detail(coord)} · ${inbox}`);
   else if (s.coordinatorOn !== false) console.log(`Coordinator: on duty, idle until the next question, approval or comment · ${inbox}`);
-  else console.log('Coordinator: off for these projects (Setup › Fleet › Roles)');
+  else console.log('Full agents, one epic each (Fleet 5): no Coordinator');
   if (lander) console.log(`Merge queue: landing now  ${detail(lander)}`);
   const workers = s.workers.filter((w) => w.role !== 'coordinator');
-  if (!workers.length) console.log('No worker running: it waits for ready tasks.');
+  if (!workers.length) console.log('No agent running: it waits for an epic with ready work.');
   for (const w of workers) console.log(`  ${w.label ?? `${w.role ?? 'developer'} ${w.task ?? w.project}`}  ${detail(w)}`);
   if (s.carried?.length) console.log(`Carried over from a stopped run: ${carriedText(s.carried)}`);
   console.log(`Log: ${untilde(LOG_FILE)}`);
