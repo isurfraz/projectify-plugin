@@ -29,6 +29,8 @@ const CLAUDE_JSON = process.env.PROJECTIFY_CLAUDE_JSON || path.join(os.homedir()
 const SHIM = path.join(process.env.PROJECTIFY_SHIM_DIR || path.join(os.homedir(), '.local', 'bin'), 'projectify');
 
 const NEXT_WAIT_S = 25;
+/** SPM-1203: how long an epic agent may sit idle with its Projectify session open before the launcher frees its slot. */
+const AGENT_IDLE_MAX_MS = 45 * 60_000;
 const HEARTBEAT_MS = 30_000;
 // SPM-1091: waits before retrying a heartbeat that met a redeploy (502/503/504 or no answer)
 const HEARTBEAT_RETRY_MS = [2_000, 5_000, 10_000];
@@ -307,7 +309,7 @@ function backgroundAgents() {
 }
 const agentIds = (a) => [a.id, a.shortId, a.sessionId, a.name].filter(Boolean).map(String);
 const isDone = (a) => a.state === 'done' || a.status === 'exited' || a.status === 'stopped' || a.status === 'failed' || a.status === 'completed';
-/** Working, or waiting on a permission: not idle. A worker that worked and went idle has ended its turn for good. */
+/** Working, or waiting on a permission: not idle. An old-role worker that worked and went idle has ended its turn for good; an epic agent may only be waiting (SPM-1203). */
 const isBusy = (a) => a.state === 'working' || (a.status && a.status !== 'idle');
 
 /** Starts one fleet session for a fire, with its role's agent; resolves with the id `claude --bg` printed. */
@@ -894,7 +896,31 @@ async function fleet(o) {
         w.seen = true;
         if (isBusy(a)) w.worked = true;
         // state blocked + status idle: the turn ended asking for a person, whom nobody watching a worker is
-        if (isDone(a) || (w.worked && !isBusy(a))) {
+        // SPM-1203: an epic agent goes idle while its subagents and background commands run, and wakes when they end.
+        // Idle is not finished for it: it is done when its Projectify session ends (doneSince, below) or its process
+        // exits; only an agent idle for AGENT_IDLE_MAX_MS with its session still open counts as stuck.
+        const agentRole = roleOf(w.fire) === 'agent';
+        let idleCheck = false; // the agent just went idle, or is about to be ended as stuck: look for out of credits
+        if (agentRole && !isDone(a)) {
+          if (isBusy(a)) delete w.idleSince;
+          else if (!w.idleSince) {
+            w.idleSince = Date.now();
+            idleCheck = true;
+          }
+        }
+        const stuck = agentRole && !isDone(a) && !w.doneSince && w.idleSince && Date.now() - w.idleSince > AGENT_IDLE_MAX_MS;
+        if (idleCheck || stuck) {
+          const out = outOfUse(workerTail(w.bgId));
+          if (out) {
+            await endWorker(w, 'out of credits or usage');
+            await ranOut(out, w.label);
+            return;
+          }
+        }
+        if (stuck) {
+          say(`${w.label} sat idle for ${Math.round(AGENT_IDLE_MAX_MS / 60_000)} min without ending its session; slot free (claude logs ${w.bgId})`);
+          await endWorker(w, 'idle without ending its session');
+        } else if (isDone(a) || (!agentRole && w.worked && !isBusy(a))) {
           const out = outOfUse(workerTail(w.bgId));
           if (out) {
             await endWorker(w, 'out of credits or usage');
