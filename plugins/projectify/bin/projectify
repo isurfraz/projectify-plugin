@@ -45,7 +45,13 @@ const DEFAULT_FOLDERS = ['~/Documents/GitHub', '~/code'];
 // main ask on the board. The statusline saves plan use to quota.json for the heartbeat. A repo's own .mcp.json
 // servers are approved up front: each worker is a new worktree folder, so its "New MCP server" prompt would block it.
 const DEFAULT_WORKER_SETTINGS = {
-  permissions: { ask: ['Bash(git push origin main:*)', 'Bash(git push origin HEAD:main:*)', 'Bash(git push -f origin main:*)', 'Bash(git push --force origin main:*)'] },
+  // SPM-1241 (Isaac, 28 Nov: "agents have to be able to merge their own prs"): an epic agent merges its own reviewed PR
+  // (merge=on); auto mode's check refused `gh pr merge` now and then, which left finished epics waiting for a person
+  permissions: {
+    allow: ['Bash(gh pr merge:*)'],
+    deny: ['Bash(gh pr merge --admin:*)', 'Bash(gh pr merge * --admin:*)'],
+    ask: ['Bash(git push origin main:*)', 'Bash(git push origin HEAD:main:*)', 'Bash(git push -f origin main:*)', 'Bash(git push --force origin main:*)'],
+  },
   statusLine: { type: 'command', command: `${JSON.stringify(path.join(PLUGIN_ROOT, 'hooks', 'statusline.sh'))} ${JSON.stringify(DATA_DIR)}` },
   enableAllProjectMcpServers: true,
   // a repo onboarded into Projectify carries its own `projectify` server in .mcp.json; signed out, it shadows the
