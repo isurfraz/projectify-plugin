@@ -10,7 +10,7 @@ Define before you create: no task exists until the gates for its size are passed
 1. Read the project's own Define stages with `get_workflow({ project, moment: "defining" })`. They are this workspace's version and win over the outline below.
 2. Read what exists so nothing is duplicated: the Brief, the project's docs and Decisions (`list_docs`), `search` and `list_tasks`, and the code the work touches.
 3. Walk the stages in order. Ask at each gate with your multiple-choice tool (AskUserQuestion in Claude Code; `ask_question` when the person is not in this chat), the option you recommend first. Put the gate's detail in your chat message first as a short list, one item per line, and keep the widget's question to one short sentence. Record their words as the approval (`update_task` approve, or on `create_task`).
-4. Size decides how far you go: **S** (a fix or tweak under one session) is one task after Gate A. **M** is one epic of several tasks. **L** adds a spec and a plan as docs (`create_doc`).
+4. Size decides how far you go: **S** (a fix or tweak under one session) is one task after Gate A. **M** is one epic of several tasks. **L** adds a spec and a plan as docs (`create_doc`). One fleet worker takes an epic end to end, so an epic holds only work one machine can do: work that needs a resource only some machines or accounts have (Higgsfield, Blender, Unity, a simulator) goes in an epic of its own, so the worker with that resource takes all of it.
 5. Create the work only at the Board stage. Every task carries a **summary** (one plain sentence a newcomer understands, no refs or code), ## Why, ## What, ## Done when (checkable items) and ## Not doing unless asked. Set `needs_from_you` when it needs a person.
 6. Tell the person what ranks above the new work or blocks it, and wait for their go before anyone claims it.
 
@@ -25,4 +25,4 @@ Define before you create: no task exists until the gates for its size are passed
 - **Define 7 · Board**: After the gates above.
 - **Define 8 · Consistency check**: M and L work, before the first claim. Gate: the person said go.
 
-Never leave an "Open questions" section: a question is asked, not stored. Never create many top-level tasks: one request is one task, or one epic.
+Never leave an "Open questions" section: a question is asked, not stored. Never create many top-level tasks: one request is one task, or one epic (plus an epic for each resource, as step 4 says).
