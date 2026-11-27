@@ -30,6 +30,9 @@ const SHIM = path.join(process.env.PROJECTIFY_SHIM_DIR || path.join(os.homedir()
 
 const NEXT_WAIT_S = 25;
 const HEARTBEAT_MS = 30_000;
+// SPM-1091: waits before retrying a heartbeat that met a redeploy (502/503/504 or no answer)
+const HEARTBEAT_RETRY_MS = [2_000, 5_000, 10_000];
+const HEARTBEAT_TIMEOUT_MS = 15_000;
 // An extra heartbeat (a look-ahead report, a rescan) comes at most this often, and only with something to report:
 // a run-app need re-checked on every answer used to heartbeat several times a second and flood the API.
 const MIN_EXTRA_BEAT_MS = 10_000;
@@ -714,7 +717,31 @@ async function fleet(o) {
     }, wait);
     extraBeat.unref?.();
   };
-  const heartbeat = async () => {
+  // SPM-1091: every merge to main redeploys the API, and for a few seconds Traefik answers 502 while the old container
+  // stops. A heartbeat that fails like that is retried quietly; only an outage that outlasts the retries is said, once,
+  // and one line says when the API answers again.
+  const transient = (e) => e instanceof ApiError && [0, 502, 503, 504].includes(e.status) && !e.message.startsWith('no machine token');
+  let beating = false; // a heartbeat (with its retries) is in flight: another one waits for it rather than pile up
+  let beatAgain = false; // one was asked for meanwhile (a report, a rescan): it goes as soon as this one ends
+  let downSince = 0; // when heartbeats started failing
+  let downSaid = false; // the outage was said in the terminal
+  const heartbeat = async (tick = false) => {
+    if (beating) {
+      if (!tick) beatAgain = true;
+      return;
+    }
+    beating = true;
+    try {
+      await beatOnce();
+    } finally {
+      beating = false;
+      if (beatAgain) {
+        beatAgain = false;
+        soonBeat('queued');
+      }
+    }
+  };
+  const beatOnce = async () => {
     lastBeatAt = Date.now();
     // SPM-962: the apps, simulators and load of this machine; a failed scan must never cost the heartbeat
     let found = { tools: undefined, machine: undefined };
@@ -730,13 +757,41 @@ async function fleet(o) {
     const leaseEvents = all.slice(0, 64);
     pendingEvents.push(...all.slice(64));
     const needReports = lookAhead.take();
-    const r = await api('POST', `/fleet/${fleetId}/heartbeat`, {
+    const body = {
       ...(leaseEvents.length ? { lease_events: leaseEvents } : {}),
       running: [...running.values()].map((w) => ({ fire: w.fire.fire, worker: w.bgId, task: w.fire.task, since: w.since, last: w.last ?? null })),
       quota: quota(),
       ...(found.tools ? { tools: found.tools, machine: found.machine } : {}),
       ...(needReports.length ? { needs: needReports } : {}),
-    }).catch((e) => (say(`heartbeat failed: ${e.message}`), pendingEvents.unshift(...leaseEvents), lookAhead.putBack(needReports), null));
+    };
+    let r = null;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        r = await api('POST', `/fleet/${fleetId}/heartbeat`, body, { timeoutMs: HEARTBEAT_TIMEOUT_MS });
+        break;
+      } catch (e) {
+        downSince ||= Date.now();
+        if (transient(e) && attempt < HEARTBEAT_RETRY_MS.length && stopping !== 'now') {
+          log(`heartbeat retry ${attempt + 1} in ${HEARTBEAT_RETRY_MS[attempt] / 1000} s: ${e.message}`);
+          await sleep(HEARTBEAT_RETRY_MS[attempt]);
+          continue;
+        }
+        if (!transient(e)) say(`heartbeat failed: ${e.message}`);
+        else if (!downSaid) say(`heartbeat failed: ${e.message} (still trying every ${HEARTBEAT_MS / 1000} s)`);
+        else log(`heartbeat failed: ${e.message}`);
+        downSaid ||= transient(e);
+        pendingEvents.unshift(...leaseEvents);
+        lookAhead.putBack(needReports);
+        break;
+      }
+    }
+    if (r && downSince) {
+      const away = Math.round((Date.now() - downSince) / 1000);
+      if (downSaid) say(`Projectify answers again (away ${away} s)`);
+      else log(`heartbeat got through after ${away} s`);
+      downSince = 0;
+      downSaid = false;
+    }
     // SPM-992: what the ready tasks need next: open it, check the sign-ins, tidy what nothing needs any more
     if (r?.lookAhead) lookAhead.update(r.lookAhead, running.size);
     // SPM-967: what the board asks of this machine's leases (switch a folder, collect, restore, boot a simulator)
@@ -764,7 +819,7 @@ async function fleet(o) {
     }
   };
   beat = () => lookAhead.pending() && soonBeat('look-ahead');
-  const hb = setInterval(heartbeat, HEARTBEAT_MS);
+  const hb = setInterval(() => heartbeat(true).catch((e) => log(`heartbeat failed: ${e.message}`)), HEARTBEAT_MS);
   hb.unref();
   heartbeat().catch((e) => log(`first heartbeat failed: ${e.message}`)); // the machine's resources show at once, not after 30 s
 
