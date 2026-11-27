@@ -9,9 +9,8 @@
 //   projectify setup-machine [FOLDERS…] [--dry-run]
 //
 // The launcher long-polls the board over HTTPS with this machine's token, so waiting for work costs no
-// Claude tokens, and starts one `claude --bg --worktree` session per fire in the project's repo. A fire has a role
-// (SPM-503, Fleet 3): planner and developer run the worker agent, reviewer and coordinator their own read-only agents.
-// SPM-590 (Fleet 4): a land fire (role coordinator, event land) merges the passed PRs of the merge queue in one push to main.
+// Claude tokens, and starts one `claude --bg --worktree` session per fire in the project's repo. Fleet 5 (D-144): every
+// fire is a full agent (role agent) that owns one epic; a fire with an older role is reported and ended, never started.
 'use strict';
 
 const fs = require('node:fs');
@@ -55,72 +54,28 @@ const DEFAULT_WORKER_SETTINGS = {
 };
 /** worker-settings.json in the data folder adds to (or replaces keys of) the defaults. */
 const workerSettings = () => ({ ...DEFAULT_WORKER_SETTINGS, ...(readJson(path.join(DATA_DIR, 'worker-settings.json')) ?? {}) });
-/**
- * SPM-590 (Fleet 4): a land worker's one job is the push to main, which the project's merging setting allowed: the
- * default ask rules for it go and the fast-forward push is allowed. Force pushes still ask.
- */
-const LAND_PUSH = ['Bash(git push origin HEAD:main)', 'Bash(git push origin HEAD:main:*)'];
-function landSettings() {
-  const s = workerSettings();
-  const perms = s.permissions ?? {};
-  return {
-    ...s,
-    permissions: {
-      ...perms,
-      ask: (perms.ask ?? []).filter((r) => !LAND_PUSH.includes(r) && r !== 'Bash(git push origin main:*)'),
-      allow: [...new Set([...(perms.allow ?? []), ...LAND_PUSH])],
-    },
-  };
-}
 // Workers load no claude.ai connectors (§11a.7: they were most of a worker's ~61k baseline); the plugin's own server stays.
 const WORKER_ENV = { ENABLE_CLAUDEAI_MCP_SERVERS: 'false' };
 /** Plan use the worker statusline last wrote (SPM-480), for the heartbeat's quota stop. */
 const quota = () => readJson(path.join(DATA_DIR, 'quota.json'));
 
-// SPM-503 (Fleet 3): each fire has a role. An older API sends none: a planning step is the planner, the rest developers.
-// SPM-1072 (D-144, Fleet 5): the API now sends only role agent, a full agent that owns one epic; the older roles stay
-// readable for a fire an older API sends.
-const ROLES = ['agent', 'planner', 'developer', 'reviewer', 'coordinator', 'qa'];
-const roleOf = (fire) => (ROLES.includes(fire?.role) ? fire.role : fire?.step === 'planning' ? 'planner' : 'developer');
-/** The plugin agent each role starts with; PROJECTIFY_<WORKER|REVIEWER|COORDINATOR>_AGENT overrides it (plugin development). */
-const ROLE_AGENTS = {
-  agent: () => process.env.PROJECTIFY_AGENT_AGENT || 'projectify:projectify-agent',
-  planner: () => process.env.PROJECTIFY_WORKER_AGENT || 'projectify:projectify-worker',
-  developer: () => process.env.PROJECTIFY_WORKER_AGENT || 'projectify:projectify-worker',
-  reviewer: () => process.env.PROJECTIFY_REVIEWER_AGENT || 'projectify:projectify-reviewer',
-  coordinator: () => process.env.PROJECTIFY_COORDINATOR_AGENT || 'projectify:projectify-coordinator',
-  qa: () => process.env.PROJECTIFY_QA_AGENT || 'projectify:projectify-qa',
-};
-/** Reviewer, Coordinator and QA read, play and comment; they never change files. */
-const READ_ONLY_ROLES = new Set(['reviewer', 'coordinator', 'qa']);
-const READ_ONLY_DISALLOWED = 'Edit,Write,NotebookEdit';
-/** SPM-590: a land fire: the Coordinator agent landing the merge queue in one push to main. */
-const isLand = (fire) => fire?.event === 'land';
-/** A land fire's PRs: the field, else its payload's land= lines. */
-const landOf = (fire) =>
-  Array.isArray(fire?.land) ? fire.land : String(fire?.payload ?? '').split('\n').filter((l) => l.startsWith('land=')).map((l) => ({ task: l.slice(5).split(' ')[0] }));
-const prs = (n) => `${n} PR${n === 1 ? '' : 's'}`;
-/** The round a fire carries: the field, else its payload's round= line, else 0. */
-const roundOf = (fire) => Number(fire?.round ?? (String(fire?.payload ?? '').match(/^round=(\d+)/m) ?? [])[1] ?? 0) || 0;
-/** The terminal name of a fire: "developer SPM-12 (rework on spm-12-x)", "reviewer SPM-12 round 1", "coordinator: 3 items". */
+// SPM-1072 (D-144, Fleet 5): the launcher starts only full agents (role agent), each owning one epic. SPM-1230: a fire
+// with another role (planner, developer, reviewer, coordinator, qa, or a land fire, all from an older API) is reported
+// in one line and ended on the board, never started. An older API that sends no role meant a worker.
+const roleOf = (fire) => (typeof fire?.role === 'string' && fire.role ? fire.role : 'worker');
+const isAgentFire = (fire) => roleOf(fire) === 'agent' && fire?.event !== 'land';
+/** The plugin agent a fire starts with; PROJECTIFY_AGENT_AGENT overrides it (plugin development). */
+const agentName = () => process.env.PROJECTIFY_AGENT_AGENT || 'projectify:projectify-agent';
 /** SPM-508: "on opus, effort high" for the started line and fleet status; empty when the worker runs on its defaults. */
 function modelText(fire) {
   const parts = [fire.model ? `on ${fire.model}` : null, fire.effort ? `effort ${fire.effort}` : null, fire.fallbackModel ? `fallback ${fire.fallbackModel}` : null].filter(Boolean);
   return parts.join(', ');
 }
 
-function fireLabel(fire, inbox) {
-  const role = roleOf(fire);
-  if (isLand(fire)) return `land ${fire.project}: ${prs(landOf(fire).length)}`;
-  if (role === 'coordinator') {
-    const n = typeof fire.inbox === 'number' ? fire.inbox : inbox;
-    return `coordinator${n ? `: ${n} item${n === 1 ? '' : 's'}` : ''}`;
-  }
+/** The terminal name of a fire: "agent SPM-12 (epic)"; an older role's fire "reviewer SPM-12". */
+function fireLabel(fire) {
   const what = fire.task ?? `${fire.project} (${fire.event})`;
-  if (role === 'agent') return `agent ${what} (epic)`;
-  if (role === 'reviewer') return `reviewer ${what}${roundOf(fire) ? ` round ${roundOf(fire)}` : ''}`;
-  if (role === 'developer' && fire.branch) return `developer ${what} (rework on ${fire.branch})`;
-  return `${role} ${what}`;
+  return isAgentFire(fire) ? `agent ${what} (epic)` : `${fire.event === 'land' ? 'land' : roleOf(fire)} ${what}`;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -309,10 +264,10 @@ function backgroundAgents() {
 }
 const agentIds = (a) => [a.id, a.shortId, a.sessionId, a.name].filter(Boolean).map(String);
 const isDone = (a) => a.state === 'done' || a.status === 'exited' || a.status === 'stopped' || a.status === 'failed' || a.status === 'completed';
-/** Working, or waiting on a permission: not idle. An old-role worker that worked and went idle has ended its turn for good; an epic agent may only be waiting (SPM-1203). */
+/** Working, or waiting on a permission: not idle. An idle epic agent may only be waiting on its subagents (SPM-1203). */
 const isBusy = (a) => a.state === 'working' || (a.status && a.status !== 'idle');
 
-/** Starts one fleet session for a fire, with its role's agent; resolves with the id `claude --bg` printed. */
+/** Starts one fleet session for an agent fire; resolves with the id `claude --bg` printed. */
 function startWorker(fire) {
   // SPM-602 (D-094): Claude in Chrome when the project's workers may use the browser; an older API sends no chrome
   const args = ['--bg', fire.chrome === true ? '--chrome' : '--no-chrome', '--worktree', fire.worktree, '--permission-mode', 'auto'];
@@ -320,10 +275,8 @@ function startWorker(fire) {
   // SPM-508 (D-090): an older API sends neither: no flag, the worker's own default
   if (fire.effort) args.push('--effort', fire.effort);
   if (fire.fallbackModel) args.push('--fallback-model', fire.fallbackModel);
-  const role = roleOf(fire);
-  if (READ_ONLY_ROLES.has(role)) args.push('--disallowedTools', READ_ONLY_DISALLOWED);
-  args.push('--settings', JSON.stringify(isLand(fire) ? landSettings() : workerSettings()));
-  args.push('--agent', ROLE_AGENTS[role]());
+  args.push('--settings', JSON.stringify(workerSettings()));
+  args.push('--agent', agentName());
   // plugin development: extra claude arguments (SPM-1159: checked once at start)
   args.push(...CLAUDE_EXTRA_ARGS);
   args.push(fire.payload);
@@ -439,31 +392,6 @@ async function stopWorker(id) {
   await removeWorker(id);
 }
 
-/**
- * SPM-503: a reviewer's or coordinator's worktree goes when it ends. `claude rm` normally deletes it; when it could
- * not (a WorktreeRemove hook, untracked build output), remove the folder this launcher had Claude Code create, and
- * only that: <repo>/.claude/worktrees/<worktree>, listed by git as a worktree of the repo. Its worktree-<name> branch
- * goes too (these roles never commit).
- */
-function removeRoleWorktree(fire) {
-  if (!READ_ONLY_ROLES.has(roleOf(fire)) || !fire.repoPath || !fire.worktree || /[\\/]|^\.\.?$/.test(fire.worktree)) return;
-  const dir = path.join(fire.repoPath, '.claude', 'worktrees', fire.worktree);
-  if (!fs.existsSync(dir)) return;
-  const real = (p) => {
-    try {
-      return fs.realpathSync(p);
-    } catch {
-      return path.resolve(p);
-    }
-  };
-  const list = run('git', ['-C', fire.repoPath, 'worktree', 'list', '--porcelain']);
-  const listed = list.ok && list.out.split('\n').some((l) => l.startsWith('worktree ') && real(l.slice(9)) === real(dir));
-  if (!listed) return log(`left ${dir}: git does not list it as a worktree of ${fire.repoPath}`);
-  const rm = run('git', ['-C', fire.repoPath, 'worktree', 'remove', '--force', dir]);
-  const br = run('git', ['-C', fire.repoPath, 'branch', '-D', `worktree-${fire.worktree}`]);
-  log(`git worktree remove ${dir}: ${rm.ok ? 'removed' : rm.err} · branch worktree-${fire.worktree}: ${br.ok ? 'deleted' : br.err}`);
-}
-
 // ---------------------------------------------------------------------------------------------
 // fleet
 // ---------------------------------------------------------------------------------------------
@@ -488,19 +416,9 @@ function parseFleetArgs(argv) {
   return o;
 }
 
-/** SPM-587: the Coordinator's session ends when its inbox is empty, but it stays on duty and wakes on the next item. */
-const COORDINATOR_IDLE = 'Coordinator: inbox handled; still on duty, it wakes on the next question, approval or comment';
-
-/** " · roles: developer, reviewer, coordinator" when the API sends a project's roles (SPM-503), else nothing. */
-const rolesText = (roles) => {
-  // SPM-1072 (D-144): every worker is a full agent, one per epic
-  if (!roles || typeof roles !== 'object' || !(roles.reviewer || roles.coordinator || roles.qa)) return ' · full agents, one epic each';
-  const on = ['reviewer', 'coordinator', 'qa'].filter((r) => roles[r]).map((r) => (r === 'reviewer' && roles.merge ? 'reviewer (merges)' : r));
-  return ` · roles: developer${on.length ? ', ' + on.join(', ') : ''}`;
-};
-
 function printProjects(projects, skipped, missed = []) {
-  for (const p of projects) say(`working ${p.key} · ${p.name} · ${untilde(p.repoPath)}${rolesText(p.roles)}`);
+  // SPM-1072 (D-144): every worker is a full agent, one per epic
+  for (const p of projects) say(`working ${p.key} · ${p.name} · ${untilde(p.repoPath)} · full agents, one epic each`);
   for (const s of skipped) say(`skipping ${s.key}${s.name ? ` · ${s.name}` : ''}: ${s.why}`);
   // SPM-964: a fleet started with keys works only those, and never sees projects turned on later
   if (missed.length) say(`will miss ${missed.map((p) => p.key).join(', ')} (fleet on, not in this list; start without project keys to work every fleet-on project)`);
@@ -523,7 +441,7 @@ async function dryRun(o) {
   for (const k of o.keys) if (!repo.has(k) && !skipped.some((s) => s.key === k)) skipped.push({ key: k, name: null, why: 'no project with that key in this workspace' });
   const cap = Math.min(o.workers ?? machine.machine.maxWorkers, machine.machine.maxWorkers);
   console.log(`Dry run on ${machine.machine.label}: up to ${cap} worker${cap === 1 ? '' : 's'} at a time.`);
-  printProjects(worked.map((p) => ({ ...p, roles: p.roles ?? machine.projects.find((m) => m.key === p.key)?.roles })), skipped);
+  printProjects(worked, skipped);
   const keys = new Set(worked.map((p) => p.key));
   const tasks = queue.tasks.filter((t) => keys.has(t.project));
   if (!tasks.length) console.log('Nothing ready in an epic (open epics with no tasks yet are also taken, to flesh out).');
@@ -589,6 +507,29 @@ const alive = (s) => {
   return began <= since + 60_000;
 };
 
+/**
+ * A Reviewer, Coordinator or QA session of a 1.20.x launcher (they never committed) left a worktree and its branch;
+ * cleaning up its old state entry removes both, but only a worktree git lists for that repo.
+ */
+function removeOldRoleWorktree(fire) {
+  if (!['reviewer', 'coordinator', 'qa'].includes(fire?.role) || !fire.repoPath || !fire.worktree || /[\\/]|^\.\.?$/.test(fire.worktree)) return;
+  const dir = path.join(fire.repoPath, '.claude', 'worktrees', fire.worktree);
+  if (!fs.existsSync(dir)) return;
+  const real = (p) => {
+    try {
+      return fs.realpathSync(p);
+    } catch {
+      return path.resolve(p);
+    }
+  };
+  const list = run('git', ['-C', fire.repoPath, 'worktree', 'list', '--porcelain']);
+  const listed = list.ok && list.out.split('\n').some((l) => l.startsWith('worktree ') && real(l.slice(9)) === real(dir));
+  if (!listed) return log(`left ${dir}: git does not list it as a worktree of ${fire.repoPath}`);
+  const rm = run('git', ['-C', fire.repoPath, 'worktree', 'remove', '--force', dir]);
+  const br = run('git', ['-C', fire.repoPath, 'branch', '-D', `worktree-${fire.worktree}`]);
+  log(`git worktree remove ${dir}: ${rm.ok ? 'removed' : rm.err} · branch worktree-${fire.worktree}: ${br.ok ? 'deleted' : br.err}`);
+}
+
 async function fleet(o) {
   if (o.dryRun) return dryRun(o);
   const prev = readJson(STATE_FILE);
@@ -615,9 +556,7 @@ async function fleet(o) {
 
   /** fire id → { fire, bgId, task, since, last } */
   const running = new Map();
-  // SPM-587: whether a Coordinator is on duty for this run (any project with it on); it runs only while its inbox has items
-  const coordinatorOn = start.projects.some((p) => p.roles && p.roles.coordinator);
-  const state = { pid: process.pid, fleet: fleetId, api: apiBase(), startedAt: new Date().toISOString(), projects: start.projects.map((p) => p.key), whenIdle, coordinatorOn, inbox: null, workers: [] };
+  const state = { pid: process.pid, fleet: fleetId, api: apiBase(), startedAt: new Date().toISOString(), projects: start.projects.map((p) => p.key), whenIdle, workers: [] };
   const persist = () =>
     saveState({ ...state, cleanup: leftToClean, workers: [...running.values()].map((w) => ({ fire: w.fire.fire, role: roleOf(w.fire), event: w.fire.event ?? null, label: w.label, task: w.fire.task, project: w.fire.project, worktree: w.fire.worktree, branch: w.fire.branch ?? null, model: w.fire.model ?? null, effort: w.fire.effort ?? null, fallbackModel: w.fire.fallbackModel ?? null, bgId: w.bgId, since: w.since })) });
   persist();
@@ -627,11 +566,7 @@ async function fleet(o) {
     for (const c of leftToClean.slice()) {
       await runAsync('claude', ['stop', c.bgId], 10_000, { detached: true });
       await removeWorker(c.bgId);
-      try {
-        removeRoleWorktree(c.fire);
-      } catch (e) {
-        log(`tidy-up of ${c.bgId}: ${e.message}`);
-      }
+      removeOldRoleWorktree(c.fire);
       const i = leftToClean.indexOf(c);
       if (i >= 0) leftToClean.splice(i, 1);
       persist();
@@ -651,16 +586,12 @@ async function fleet(o) {
     if (stopOnlyNow && w.bgId) leftToClean.push({ bgId: w.bgId, fire: w.fire });
     persist();
     if (stopOnlyNow) {
-      // stop now: the stop is all that must finish; rm and worktree removal wait (the next start tidies up)
+      // stop now: the stop is all that must finish; rm waits (the next start tidies up)
       await stopOnly(w.bgId);
     } else {
       await stopWorker(w.bgId);
-      removeRoleWorktree(w.fire);
     }
-    const r = await api('POST', `/fleet/${w.fleetId ?? fleetId}/workers/${w.fire.fire}/end`, { reason }, stopping === 'now' ? { timeoutMs: 5_000 } : undefined).catch((e) => (say(`could not report the end of ${w.fire.task ?? w.fire.fire}: ${e.message}`), null));
-    // SPM-590: what the land worker reported (an older API sends nothing)
-    if (isLand(w.fire) && r && r.land)
-      say(r.land.landed ? `Landed ${prs(r.land.landed)} in push ${String(r.land.commit ?? '').slice(0, 7)}${r.land.left ? ` · ${r.land.left} not merged (on the board)` : ''}` : `Landing ${w.fire.project}: nothing landed${r.land.left ? ` · ${r.land.left} back to the queue or the board` : ''}`);
+    await api('POST', `/fleet/${w.fleetId ?? fleetId}/workers/${w.fire.fire}/end`, { reason }, stopping === 'now' ? { timeoutMs: 5_000 } : undefined).catch((e) => say(`could not report the end of ${w.fire.task ?? w.fire.fire}: ${e.message}`));
   };
 
   // SPM-971: the API stops a fleet whose launcher sent no heartbeat for 10 minutes (a network drop). That is not a stop
@@ -727,16 +658,7 @@ async function fleet(o) {
     await finish(r?.reason ?? `out of credits or usage${when}`);
   };
 
-  const countText = () => {
-    const by = {};
-    for (const w of running.values()) {
-      const r = isLand(w.fire) ? 'landing' : roleOf(w.fire);
-      by[r] = (by[r] ?? 0) + 1;
-    }
-    const name = { developer: 'worker', reviewer: 'reviewer', coordinator: 'Coordinator', landing: 'landing', qa: 'QA' };
-    const parts = Object.entries(by).map(([r, n]) => `${n} ${name[r] ?? r}${n > 1 && r !== 'landing' && r !== 'coordinator' ? 's' : ''}`);
-    return `${running.size} running${parts.length ? `: ${parts.join(', ')}` : ''}`;
-  };
+  const countText = () => `${running.size} agent${running.size === 1 ? '' : 's'} running`;
   process.on('SIGINT', async () => {
     if (!stopping) {
       stopping = 'after_current';
@@ -894,21 +816,19 @@ async function fleet(o) {
       if (a) {
         w.last = a.status ?? w.last;
         w.seen = true;
-        if (isBusy(a)) w.worked = true;
         // state blocked + status idle: the turn ended asking for a person, whom nobody watching a worker is
         // SPM-1203: an epic agent goes idle while its subagents and background commands run, and wakes when they end.
         // Idle is not finished for it: it is done when its Projectify session ends (doneSince, below) or its process
         // exits; only an agent idle for AGENT_IDLE_MAX_MS with its session still open counts as stuck.
-        const agentRole = roleOf(w.fire) === 'agent';
         let idleCheck = false; // the agent just went idle, or is about to be ended as stuck: look for out of credits
-        if (agentRole && !isDone(a)) {
+        if (!isDone(a)) {
           if (isBusy(a)) delete w.idleSince;
           else if (!w.idleSince) {
             w.idleSince = Date.now();
             idleCheck = true;
           }
         }
-        const stuck = agentRole && !isDone(a) && !w.doneSince && w.idleSince && Date.now() - w.idleSince > AGENT_IDLE_MAX_MS;
+        const stuck = !isDone(a) && !w.doneSince && w.idleSince && Date.now() - w.idleSince > AGENT_IDLE_MAX_MS;
         if (idleCheck || stuck) {
           const out = outOfUse(workerTail(w.bgId));
           if (out) {
@@ -920,14 +840,14 @@ async function fleet(o) {
         if (stuck) {
           say(`${w.label} sat idle for ${Math.round(AGENT_IDLE_MAX_MS / 60_000)} min without ending its session; slot free (claude logs ${w.bgId})`);
           await endWorker(w, 'idle without ending its session');
-        } else if (isDone(a) || (!agentRole && w.worked && !isBusy(a))) {
+        } else if (isDone(a)) {
           const out = outOfUse(workerTail(w.bgId));
           if (out) {
             await endWorker(w, 'out of credits or usage');
             await ranOut(out, w.label);
             return;
           }
-          say(isLand(w.fire) ? `${w.label} finished` : roleOf(w.fire) === 'coordinator' ? COORDINATOR_IDLE : `${w.label} finished (${a.status ?? 'done'}); slot free`);
+          say(`${w.label} finished (${a.status ?? 'done'}); slot free`);
           await endWorker(w, 'finished');
         } else if (w.doneSince && Date.now() - w.doneSince > 60_000 && (a.state === 'blocked' || !isBusy(a))) {
           // SPM-996: its session ended and the process still waits (blocked or idle): its work is done
@@ -939,7 +859,7 @@ async function fleet(o) {
           say(`${w.label} is blocked: an approval in Needs you, or a prompt only the terminal shows (claude attach ${w.bgId})`);
         }
       } else if (w.seen || Date.now() - Date.parse(w.since) > 120_000) {
-        say(isLand(w.fire) ? `${w.label}: its session is gone from claude agents` : roleOf(w.fire) === 'coordinator' ? `Coordinator's session is gone from claude agents; ${COORDINATOR_IDLE.slice('Coordinator: '.length)}` : `${w.label} is gone from claude agents; slot free`);
+        say(`${w.label} is gone from claude agents; slot free`);
         await endWorker(w, 'gone');
       }
     }
@@ -985,22 +905,17 @@ async function fleet(o) {
       continue;
     }
     if (r.kind === 'wait') {
-      const inbox = typeof r.inbox === 'number' ? r.inbox : null;
-      if (inbox !== state.inbox) {
-        state.inbox = inbox;
-        persist();
-      }
       // SPM-980: work carried over from a run that stopped, so a stall is visible
       const carried = Array.isArray(r.carried) ? r.carried : [];
       if (JSON.stringify(carried) !== JSON.stringify(state.carried ?? [])) {
         state.carried = carried;
         persist();
       }
-      const line = `waiting: ${r.why} (${r.running} running${inbox ? `, ${inbox} for the Coordinator` : ''}${carried.length ? `, ${carriedText(carried)}` : ''})`;
+      const line = `waiting: ${r.why} (${r.running} running${carried.length ? `, ${carriedText(carried)}` : ''})`;
       if (line !== lastWait) say(line);
       lastWait = line;
       // the server stops an idle 'stop' fleet itself (kind stop); this covers an older API that does not
-      if (whenIdle === 'stop' && r.running === 0 && running.size === 0 && /^0 ready/.test(r.why) && r.queued === 0 && !inbox) {
+      if (whenIdle === 'stop' && r.running === 0 && running.size === 0 && /^0 ready/.test(r.why) && r.queued === 0) {
         await api('POST', `/fleet/${fleetId}/stop`, { mode: 'now' }).catch(() => {});
         await finish('nothing left to take (when idle: stop)');
       }
@@ -1008,7 +923,15 @@ async function fleet(o) {
     }
     // a fire
     lastWait = '';
-    const label = fireLabel(r, state.inbox);
+    const label = fireLabel(r);
+    // SPM-1230 (D-144): only full agents start; an older API's role fire is ended on the board, like a failed start
+    if (!isAgentFire(r)) {
+      say(`skipped ${label}: this launcher starts only full agents (Fleet 5); update the board's API`);
+      await api('POST', `/fleet/${fleetId}/workers/${r.fire}/end`, { reason: `could not start: role ${r.event === 'land' ? 'land' : roleOf(r)} is retired (Fleet 5 starts only agents)`.slice(0, 200) }).catch((e) => say(`could not end ${label} on the board: ${e.message ?? e}`));
+      startBackoff = Math.min(Math.max(startBackoff * 2, 30_000), 300_000);
+      for (const until = Date.now() + startBackoff; Date.now() < until && !stopping && !finished; ) await sleep(1000);
+      continue;
+    }
     if (!r.repoPath || !fs.existsSync(r.repoPath)) {
       startBackoff = Math.min(Math.max(startBackoff * 2, 30_000), 300_000);
       say(`cannot start ${label}: its repo ${r.repoPath ? untilde(r.repoPath) + ' is missing' : 'is not recorded on this machine'} (next try in ${Math.round(startBackoff / 1000)} s)`);
@@ -1022,7 +945,7 @@ async function fleet(o) {
       startBackoff = 0;
       running.set(r.fire, { fire: r, label, bgId: w.id, since, last: 'started', fleetId });
       persist();
-      say(`${isLand(r) ? `Landing ${prs(landOf(r).length)} of ${r.project} in one push` : roleOf(r) === 'coordinator' ? 'Coordinator woke for its inbox' : `started ${label}`} in worktree ${r.worktree}${modelText(r) ? ` ${modelText(r)}` : ''}${w.id ? ` (claude ${w.id})` : ''}`);
+      say(`started ${label} in worktree ${r.worktree}${modelText(r) ? ` ${modelText(r)}` : ''}${w.id ? ` (claude ${w.id})` : ''}`);
       await api('POST', `/fleet/${fleetId}/workers`, { fire: r.fire, claude_bg_id: w.id }).catch((e) => say(`could not report ${label} started: ${e.message}`));
     } catch (e) {
       const out = outOfUse(e.message);
@@ -1995,18 +1918,10 @@ async function status() {
     const mins = Math.round((Date.now() - Date.parse(w.since)) / 60000);
     return `worktree ${w.worktree}${modelText(w) ? `  ${modelText(w)}` : ''}  ${mins} min  ${a ? `${a.status ?? ''}${a.state ? `, ${a.state}` : ''}` : 'not in claude agents'}${w.bgId ? `  (claude attach ${w.bgId})` : ''}`;
   };
-  // SPM-503: the Coordinator, and its inbox as the last wait from the board counted it
-  const coord = s.workers.find((w) => w.role === 'coordinator' && w.event !== 'land');
-  const lander = s.workers.find((w) => w.event === 'land');
-  const inbox = typeof s.inbox === 'number' ? `${s.inbox} open item${s.inbox === 1 ? '' : 's'} in its inbox at the last check` : 'inbox count not known yet';
-  // SPM-587: the Coordinator stays on duty for the whole run; its Claude session runs only while its inbox has items
-  if (coord) console.log(`Coordinator: on duty, handling its inbox now  ${detail(coord)} · ${inbox}`);
-  else if (s.coordinatorOn !== false) console.log(`Coordinator: on duty, idle until the next question, approval or comment · ${inbox}`);
-  else console.log('Full agents, one epic each (Fleet 5): no Coordinator');
-  if (lander) console.log(`Merge queue: landing now  ${detail(lander)}`);
-  const workers = s.workers.filter((w) => w.role !== 'coordinator');
-  if (!workers.length) console.log('No agent running: it waits for an epic with ready work.');
-  for (const w of workers) console.log(`  ${w.label ?? `${w.role ?? 'developer'} ${w.task ?? w.project}`}  ${detail(w)}`);
+  console.log('Full agents, one epic each (Fleet 5)');
+  if (!s.workers.length) console.log('No agent running: it waits for an epic with ready work.');
+  // a state file from an older launcher can hold other roles (coordinator, developer, a land run): printed as "<role> <task>"
+  for (const w of s.workers) console.log(`  ${w.role === 'agent' && w.label ? w.label : `${w.event === 'land' ? 'land' : (w.role ?? 'worker')} ${w.task ?? w.project}`}  ${detail(w)}`);
   if (s.carried?.length) console.log(`Carried over from a stopped run: ${carriedText(s.carried)}`);
   console.log(`Log: ${untilde(LOG_FILE)}`);
   await printResources();
