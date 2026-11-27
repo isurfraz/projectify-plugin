@@ -1169,6 +1169,37 @@ const SERVER_RETRY_MS = 5 * 60_000; // after a failed start, the next try waits 
 const SERVER_LOG_DIR = path.join(DATA_DIR, 'run-app-logs');
 const SERVER_QUIET_MS = 20_000; // with no port recorded: running this long counts as open
 
+/**
+ * The last non-empty line of a dev server's log (control codes stripped, credentials hidden, clipped), to say why it
+ * stopped. It is shown on the board, so a URL's user:password and key=value secrets are replaced.
+ */
+function lastLogLine(file) {
+  try {
+    const fd = fs.openSync(file, 'r');
+    try {
+      const size = fs.fstatSync(fd).size;
+      const len = Math.min(size, 4096);
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, size - len);
+      const lines = buf
+        .toString('utf8')
+        .replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, '')
+        .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')
+        .split(/\r\n|\r|\n/)
+        .map((l) => l.replace(/[\x00-\x1f\x7f]/g, '').trim())
+        .filter(Boolean);
+      return (lines.pop() ?? '')
+        .replace(/\/\/[^\s/:@]+:[^\s@]+@/g, '//***@')
+        .replace(/\b(password|passwd|pwd|secret|token|api[_-]?key|key)=\S+/gi, '$1=***')
+        .slice(0, 100);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return '';
+  }
+}
+
 /** Does something answer on 127.0.0.1:<port>? */
 const portOpen = (port) =>
   new Promise((resolve) => {
@@ -1294,6 +1325,16 @@ function makeLookAhead({ onReport }) {
       const listening = r.port ? await portOpen(r.port) : false;
       const ours = entry && pidAlive(entry.pid);
       if (listening) return say1('open', ours ? `the dev server answers on port ${r.port}` : `a dev server already answers on port ${r.port} (not started by the fleet)`);
+      // a server the fleet started that is gone soon after its start, with no failure noted (the launcher restarted between the start and the exit): it failed
+      if (entry && !ours && !entry.lastFailAt && entry.startedAt && now - entry.startedAt < SERVER_START_MS) {
+        const logFile = path.join(SERVER_LOG_DIR, `${r.project}.log`);
+        const tail = lastLogLine(logFile);
+        entry.lastFailAt = now;
+        entry.failWhy = `the dev server exited soon after it started${tail ? `: ${tail}` : ''} (log: ${logFile})`;
+        delete entry.pid;
+        save();
+        log(`dev server for ${r.project} failed: it exited soon after it started (log: ${logFile})`);
+      }
       if (ours) {
         const age = now - entry.startedAt;
         if (!r.port) return age >= SERVER_QUIET_MS ? say1('open', 'running (no port recorded to check)') : say1('opening', `dev server starting: ${entry.command}`);
@@ -1304,11 +1345,15 @@ function makeLookAhead({ onReport }) {
           // already gone
         }
         entry.lastFailAt = now;
+        entry.failWhy = `the dev server did not answer on port ${r.port} within 2 minutes (log: ${path.join(SERVER_LOG_DIR, `${r.project}.log`)})`;
         delete entry.pid;
         save();
-        return say1('failed', `the dev server did not answer on port ${r.port} within 2 minutes (log: ${path.join(SERVER_LOG_DIR, `${r.project}.log`)})`);
+        return say1('failed', entry.failWhy);
       }
-      if (entry?.lastFailAt && now - entry.lastFailAt < SERVER_RETRY_MS) return say1('failed', 'the last start failed; trying again in a few minutes');
+      if (entry?.lastFailAt && now - entry.lastFailAt < SERVER_RETRY_MS) {
+        const at = new Date(entry.lastFailAt + SERVER_RETRY_MS).toTimeString().slice(0, 5);
+        return say1('failed', `trying again at ${at}; ${entry.failWhy ?? 'the last start failed'}`);
+      }
       if (!r.command) return say1('needs_person', `no start command is recorded for ${r.project} on this machine: add a "Start: <command>" line to its setup notes (record_setup), or start the dev server yourself`);
       const parts = parseStartCommand(r.command);
       if (!parts) return say1('needs_person', 'the recorded start command has shell characters; use one plain command such as "pnpm dev"');
@@ -1320,8 +1365,41 @@ function makeLookAhead({ onReport }) {
       child.on('error', (e) => {
         log(`dev server for ${r.project} failed to start: ${e.message}`);
         const m = mem.servers[r.project];
-        if (m) (m.lastFailAt = Date.now()), delete m.pid;
+        if (m) (m.lastFailAt = Date.now()), (m.failWhy = `could not start ${parts[0]}: ${e.message}`), delete m.pid, save();
         said(r.need, 'failed', `could not start ${parts[0]}: ${e.message}`, r.project);
+      });
+      // a dev server that exits (code ≠ 0, or any exit within the start window) failed: back off instead of starting it again on the next pass
+      child.on('exit', (code, signal) => {
+        const m = mem.servers[r.project];
+        // the spawn itself failed (the error handler reports it), the fleet stopped it itself (no answer in time, or tidy), or a newer start replaced it
+        if (!m || !child.pid || m.pid !== child.pid) return;
+        delete m.pid;
+        const logFile = path.join(SERVER_LOG_DIR, `${r.project}.log`);
+        if (code === 0 && Date.now() - m.startedAt >= SERVER_START_MS) {
+          save();
+          return log(`dev server for ${r.project} exited with code 0 (log: ${logFile})`);
+        }
+        const how = signal ? `was stopped by ${signal}` : `exited with code ${code}`;
+        const tail = lastLogLine(logFile);
+        m.lastFailAt = Date.now();
+        m.failWhy = `the dev server ${how}${tail ? `: ${tail}` : ''} (log: ${logFile})`;
+        save();
+        const report = () => {
+          log(`dev server for ${r.project} failed: it ${how} (log: ${logFile})`);
+          said(r.need, 'failed', m.failWhy, r.project);
+          onReport();
+        };
+        if (code !== 0 || !r.port) return report();
+        // a start command that hands off to a background server and exits 0 is fine once the port answers
+        portOpen(r.port)
+          .then((up) => {
+            if (!up) return report();
+            delete m.lastFailAt;
+            delete m.failWhy;
+            save();
+            log(`dev server command for ${r.project} exited with code 0; port ${r.port} answers`);
+          })
+          .catch(report);
       });
       child.unref();
       mem.servers[r.project] = { pid: child.pid, command: r.command, startedAt: now, neededAt: now };
