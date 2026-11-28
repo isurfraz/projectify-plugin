@@ -2000,7 +2000,7 @@ async function doctor() {
   if (machine) {
     const claudeJson = readJson(CLAUDE_JSON);
     const on = machine.projects.filter((p) => p.fleet);
-    if (!on.length) check('Projects', false, 'the fleet is off for every project', 'Switch the fleet on for a project in Projectify: People › Fleet.');
+    if (!on.length) check('Projects', false, 'the fleet is off for every project', 'Switch the fleet on for a project in Projectify: Agents › Fleet settings.');
     for (const p of on) {
       const n = `${p.key} repo`;
       if (!p.repoPath) {
@@ -2112,7 +2112,7 @@ const HELP = `projectify ${pluginVersion()}: the Projectify fleet launcher
   projectify fleet [KEYS…] [--workers N] [--watch | --until-empty] [--dry-run]
       Work every project with the fleet on and a repo on this machine, or only KEYS.
       --watch keeps watching when there is nothing to do, --until-empty stops then;
-      without either, this machine's setting (People › Fleet) decides.
+      without either, this machine's setting (Agents › Fleet settings) decides.
       Ctrl-C once stops after the current tasks, twice stops now.
   projectify fleet doctor            Check this machine and every fleet project, one fix line each
   projectify fleet status            What the fleet on this machine is doing
